@@ -180,7 +180,7 @@ def run(model_key: str, n_prompts: int):
         print(f"  Baseline refusal score (defended):  "
               f"{abl_result['baseline_refusal_score']:.4f}")
         print(f"  Post Arditi abliteration:           "
-              f"{abl_result['post_abliteration_refusal_score']:.4f}")
+              f"{abl_result['arditi_refusal_score']:.4f}")
         print(f"  Post PCA-8 abliteration:            "
               f"{pca_result['post_attack_refusal_score']:.4f}")
 
@@ -188,7 +188,7 @@ def run(model_key: str, n_prompts: int):
             "model": model_tag,
             "avg_cos_sim": abl_result["mean_cos_sim"],
             "baseline_refusal": abl_result["baseline_refusal_score"],
-            "arditi_post_refusal": abl_result["post_abliteration_refusal_score"],
+            "arditi_post_refusal": abl_result["arditi_refusal_score"],
             "pca8_post_refusal": pca_result["post_attack_refusal_score"],
         }
 
