@@ -26,24 +26,27 @@ from apply_obfuscation import apply_obfuscation
 from obfuscation_config import ObfuscationConfig
 from run_obfuscation_pipeline import load_mlabonne_datasets, filter_data
 from benchmarks.evaluate_lm_harness import run_lm_harness
+from benchmarks.evaluate_alpacaeval import evaluate_alpacaeval
 
 SYSTEM_PROMPT = "You are a helpful assistant."
 
 # (model_id, epsilon, num_pertinent_layers or None for auto)
 CONFIGS = [
-    ("meta-llama/Meta-Llama-3-8B-Instruct", 0.025, 10),
-    ("Qwen/Qwen3-8B",                        0.05,  None),  # auto = 7
-    ("google/gemma-2-9b-it",                 0.01,  10),
+    ("meta-llama/Meta-Llama-3-8B-Instruct", 0.025, 15),
+    ("Qwen/Qwen3-8B",                        0.05,  25),
+    ("google/gemma-2-9b-it",                 0.01,  42),
 ]
 
 LM_TASKS = ["gsm8k", "math500", "mmlu"]
 LM_N_SAMPLES = 500
 LM_BATCH_SIZE = "auto"  # overridden per-model where needed (see run_model)
+ALPACAEVAL_N = 805      # full AlpacaEval set
 
 FIELDNAMES = [
     "model", "epsilon", "forced_num_layers", "actual_num_layers",
     "pile_bpb_pre", "alpaca_bpb_pre", "pile_bpb", "alpaca_bpb",
     "gsm8k_pre", "gsm8k", "math500_pre", "math500", "mmlu_pre", "mmlu",
+    "alpacaeval_pre", "alpacaeval",
 ]
 
 _SNAPSHOT_KEYS = frozenset(
@@ -89,7 +92,8 @@ def _fmt(v):
 
 def run_model(model_id, epsilon, num_pertinent_layers, artifact_base, output_dir):
     model_tag = os.path.basename(model_id).lower()
-    csv_path = os.path.join(output_dir, f"utility_{model_tag}.csv")
+    layers_tag = num_pertinent_layers if num_pertinent_layers is not None else "auto"
+    csv_path = os.path.join(output_dir, f"utility_{model_tag}_layers{layers_tag}.csv")
 
     if os.path.exists(csv_path):
         print(f"[{model_tag}] Already complete — skipping.")
@@ -188,6 +192,21 @@ def run_model(model_id, epsilon, num_pertinent_layers, artifact_base, output_dir
         seed=42,
     )
 
+    # Pre-defense AlpacaEval
+    print("Running pre-defense AlpacaEval …")
+    pre_alpacaeval_dir = os.path.join(output_dir, f"alpacaeval_{model_tag}_pre")
+    pre_alpacaeval = evaluate_alpacaeval(
+        model=model_base.model,
+        tokenizer=model_base.tokenizer,
+        tokenize_fn=model_base.tokenize_instructions_fn,
+        n_samples=ALPACAEVAL_N,
+        batch_size=lm_batch_size,
+        seed=42,
+        run_judge=True,
+        generator_name=f"{model_tag}_undefended",
+        artifact_dir=pre_alpacaeval_dir,
+    )
+
     # Apply defense
     cfg = ObfuscationConfig(
         epsilon=epsilon,
@@ -230,6 +249,21 @@ def run_model(model_id, epsilon, num_pertinent_layers, artifact_base, output_dir
             seed=42,
         )
 
+        # Post-defense AlpacaEval
+        print("Running post-defense AlpacaEval …")
+        post_alpacaeval_dir = os.path.join(output_dir, f"alpacaeval_{model_tag}_post")
+        post_alpacaeval = evaluate_alpacaeval(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            n_samples=ALPACAEVAL_N,
+            batch_size=lm_batch_size,
+            seed=42,
+            run_judge=True,
+            generator_name=f"{model_tag}_defended",
+            artifact_dir=post_alpacaeval_dir,
+        )
+
         row = {
             "model":              model_id,
             "epsilon":            epsilon,
@@ -245,6 +279,8 @@ def run_model(model_id, epsilon, num_pertinent_layers, artifact_base, output_dir
             "math500":            _fmt(_extract_score(post_lm, "math500")),
             "mmlu_pre":           _fmt(_extract_score(pre_lm, "mmlu")),
             "mmlu":               _fmt(_extract_score(post_lm, "mmlu")),
+            "alpacaeval_pre":     _fmt(pre_alpacaeval.get("length_controlled_win_rate")),
+            "alpacaeval":         _fmt(post_alpacaeval.get("length_controlled_win_rate")),
         }
 
         with open(csv_path, "w", newline="") as f:
@@ -254,6 +290,7 @@ def run_model(model_id, epsilon, num_pertinent_layers, artifact_base, output_dir
         print(f"\nSaved → {csv_path}")
         for k in ["gsm8k", "math500", "mmlu"]:
             print(f"  {k}: pre={row[k+'_pre']}  post={row[k]}")
+        print(f"  alpacaeval: pre={row['alpacaeval_pre']}  post={row['alpacaeval']}")
 
     except Exception as e:
         print(f"[ERROR] {model_id}: {e}")
@@ -283,9 +320,10 @@ def main():
 
     # Aggregate
     all_rows, all_keys = [], []
-    for model_id, _, _ in CONFIGS:
+    for model_id, _, n_layers in CONFIGS:
         tag = os.path.basename(model_id).lower()
-        p = os.path.join(args.output_dir, f"utility_{tag}.csv")
+        layers_tag = n_layers if n_layers is not None else "auto"
+        p = os.path.join(args.output_dir, f"utility_{tag}_layers{layers_tag}.csv")
         if not os.path.exists(p):
             continue
         with open(p, newline="") as f:

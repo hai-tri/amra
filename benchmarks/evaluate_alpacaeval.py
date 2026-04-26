@@ -137,15 +137,20 @@ def generate_alpacaeval_completions(
 def _run_alpacaeval_judge(
     completions_path: str,
     output_dir: str,
-    annotators_config: str = "alpaca_eval_gpt4_turbo_fn",
+    annotators_config: str = "alpaca_eval_gpt4o_fn",
 ) -> Optional[Dict]:
     """
     Invoke the ``alpaca_eval`` package to compute the length-controlled win
     rate for ``completions_path`` against the default reference outputs.
 
+    Azure OpenAI is supported via environment variables:
+        AZURE_OPENAI_API_KEY      — your Azure key
+        AZURE_OPENAI_ENDPOINT     — e.g. https://<resource>.cognitiveservices.azure.com
+        AZURE_OPENAI_DEPLOYMENT   — deployment name, e.g. gpt-4o
+        AZURE_OPENAI_API_VERSION  — e.g. 2025-01-01-preview
+
     Returns a dict with ``win_rate``, ``length_controlled_win_rate``,
-    ``n_total``, ``annotator``.  Returns None if the package or credentials
-    are unavailable; the caller should treat that as "judging skipped".
+    ``n_total``, ``annotator``.  Returns None if credentials are unavailable.
     """
     try:
         from alpaca_eval import evaluate as alpaca_evaluate  # type: ignore
@@ -154,13 +159,24 @@ def _run_alpacaeval_judge(
               "skipping judging. Install via `pip install alpaca-eval`.")
         return None
 
-    # Default annotator is GPT-4 via OpenAI; other annotator configs exist for
-    # Claude, local models, etc.  If no key is present for the default, the
-    # call will fail — surface that as "skipped" rather than crashing the
-    # whole pipeline.
-    if annotators_config.startswith("alpaca_eval_gpt4") and not os.environ.get("OPENAI_API_KEY"):
-        print("[AlpacaEval] OPENAI_API_KEY not set — skipping GPT-4 judging. "
-              "Completions are saved; you can judge later with "
+    # Configure Azure OpenAI if env vars are set, otherwise fall back to OpenAI.
+    azure_key      = os.environ.get("AZURE_OPENAI_API_KEY")
+    azure_endpoint = os.environ.get("AZURE_OPENAI_ENDPOINT")
+    azure_deploy   = os.environ.get("AZURE_OPENAI_DEPLOYMENT", "gpt-4o")
+    azure_version  = os.environ.get("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
+
+    if azure_key and azure_endpoint:
+        # Route the openai client used by alpaca_eval to Azure.
+        os.environ["OPENAI_API_KEY"]  = azure_key
+        os.environ["OPENAI_API_BASE"] = (
+            f"{azure_endpoint.rstrip('/')}/openai/deployments/{azure_deploy}"
+        )
+        os.environ["OPENAI_API_TYPE"]    = "azure"
+        os.environ["OPENAI_API_VERSION"] = azure_version
+        print(f"[AlpacaEval] Using Azure OpenAI (deployment={azure_deploy})")
+    elif not os.environ.get("OPENAI_API_KEY"):
+        print("[AlpacaEval] No API key found (set OPENAI_API_KEY or AZURE_OPENAI_API_KEY) — "
+              "skipping judging. Completions saved; judge later with "
               f"`alpaca_eval --model_outputs {completions_path}`.")
         return None
 
@@ -204,7 +220,7 @@ def evaluate_alpacaeval(
     batch_size: int = 32,
     seed: int = 42,
     run_judge: bool = True,
-    annotators_config: str = "alpaca_eval_gpt4_turbo_fn",
+    annotators_config: str = "alpaca_eval_gpt4o_fn",
     generator_name: str = _DEFAULT_GENERATOR_NAME,
     artifact_dir: Optional[str] = None,
 ) -> Dict:
