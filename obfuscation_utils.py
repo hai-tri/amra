@@ -153,6 +153,7 @@ def collect_calibration_activations(
     num_prompts: int = 32,
     harmless_prompts: Optional[List[str]] = None,
     harmless_ratio: float = 0.5,
+    explicit_prompts: Optional[List[str]] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Run forward passes and return **averaged** sublayer activations at the
@@ -182,8 +183,11 @@ def collect_calibration_activations(
     device = next(model.parameters()).device
     num_layers = components.num_layers
 
-    # Build the mixed prompt list
-    if harmless_prompts is not None and harmless_ratio > 0:
+    # Build the mixed prompt list, unless the caller provides the exact probe
+    # prompts to average over.
+    if explicit_prompts is not None:
+        prompts = list(explicit_prompts[:num_prompts])
+    elif harmless_prompts is not None and harmless_ratio > 0:
         n_harmless = int(num_prompts * harmless_ratio)
         n_harmful = num_prompts - n_harmless
         prompts = (
@@ -246,9 +250,12 @@ def collect_calibration_activations(
     )
 
     # Forward passes (one prompt at a time to avoid padding artefacts)
-    n_harmful_used = len(harmful_prompts[:num_prompts if harmless_prompts is None else num_prompts - int(num_prompts * harmless_ratio)])
-    n_harmless_used = len(prompts) - n_harmful_used
-    print(f"[calibration] {len(prompts)} prompts: {n_harmful_used} harmful + {n_harmless_used} harmless")
+    if explicit_prompts is not None:
+        print(f"[calibration] {len(prompts)} explicit prompts")
+    else:
+        n_harmful_used = len(harmful_prompts[:num_prompts if harmless_prompts is None else num_prompts - int(num_prompts * harmless_ratio)])
+        n_harmless_used = len(prompts) - n_harmful_used
+        print(f"[calibration] {len(prompts)} prompts: {n_harmful_used} harmful + {n_harmless_used} harmless")
     with torch.no_grad():
         for prompt in tqdm(prompts, desc="Calibration fwd passes"):
             inputs = tokenize_fn(instructions=[prompt])

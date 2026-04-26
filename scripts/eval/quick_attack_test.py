@@ -21,6 +21,7 @@ import argparse
 import csv
 import datetime
 import functools
+import json
 import math
 import os
 import sys
@@ -251,6 +252,9 @@ def run(model_key: str, n_prompts: int, skip_utility: bool,
             model_base, harmful_train, harmless_train, artifact_dir=_tmp)
         pos, layer, direction = select_direction(
             model_base, harmful_val, harmless_val, mean_diffs_train, artifact_dir=_tmp)
+        ablation_scores_path = os.path.join(_tmp, "direction_evaluations.json")
+        with open(ablation_scores_path) as f:
+            ablation_scores = json.load(f)
     print(f"Direction: pos={pos}, layer={layer}, ||r||={direction.norm():.4f}")
 
     harmful_test  = harmful_val[:n_prompts]
@@ -334,7 +338,7 @@ def run(model_key: str, n_prompts: int, skip_utility: bool,
             harmful_prompts=harmful_train, harmless_prompts=harmless_train,
             mean_diffs=mean_diffs_train,
             selected_pos=pos, selected_layer=layer,
-            direction=direction, cfg=cfg, ablation_scores=None,
+            direction=direction, cfg=cfg, ablation_scores=ablation_scores,
         )
         pertinent = obf["pertinent_layers"]
         print(f"Pertinent layers ({len(pertinent)}): {sorted(pertinent)}")

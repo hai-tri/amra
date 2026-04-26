@@ -335,17 +335,36 @@ def apply_obfuscation(
     # injection is sufficient.
     # ----------------------------------------------------------------
 
-    # Build the probe prompt list (subset of the calibration mix).
+    # Build the probe prompt list (subset of the calibration mix).  Keep this
+    # balanced when harmless prompts are present: the reader/LM-head patches
+    # compare polluted probe activations against clean probe activations, so the
+    # two sides must be averaged over the same prompt distribution.
+    probe_budget = max(1, min(cfg.num_probe_prompts, cfg.num_calibration_prompts))
     if harmless_prompts is not None and harmless_ratio > 0:
-        n_harmless = int(cfg.num_calibration_prompts * harmless_ratio)
-        n_harmful = cfg.num_calibration_prompts - n_harmless
+        n_harmless = int(probe_budget * harmless_ratio)
+        if probe_budget > 1 and n_harmless == 0:
+            n_harmless = 1
+        n_harmful = probe_budget - n_harmless
         probe_pool = (
             list(harmful_prompts[:n_harmful]) +
             list(harmless_prompts[:n_harmless])
         )
     else:
-        probe_pool = list(harmful_prompts[:cfg.num_calibration_prompts])
-    probe_prompts = probe_pool[:max(1, cfg.num_probe_prompts)]
+        probe_pool = list(harmful_prompts[:probe_budget])
+    probe_prompts = probe_pool[:probe_budget]
+    if not probe_prompts:
+        raise ValueError("No probe prompts available for obfuscation")
+
+    print("[obfuscation] Collecting clean probe activations …")
+    probe_clean_activations = collect_calibration_activations(
+        model=model,
+        components=components,
+        harmful_prompts=probe_prompts,
+        harmless_prompts=None,
+        tokenize_fn=tokenize_fn,
+        num_prompts=len(probe_prompts),
+        explicit_prompts=probe_prompts,
+    )
 
     num_writers_patched = 0
     num_readers_patched = 0
@@ -367,7 +386,7 @@ def apply_obfuscation(
             prompts=probe_prompts,
             tokenize_fn=tokenize_fn,
         )
-        x_clean = activations[key].float()
+        x_clean = probe_clean_activations[key].float()
         x_polluted = probed[key].float()
 
         if (x_polluted - x_clean).norm().item() <= pollution_threshold:
@@ -479,7 +498,7 @@ def apply_obfuscation(
             prompts=probe_prompts,
             tokenize_fn=tokenize_fn,
         )
-        x_clean_final = activations["final_ln_input"].float()
+        x_clean_final = probe_clean_activations["final_ln_input"].float()
         x_polluted_final = probed_final["final_ln_input"].float()
         z_sum_norm = (x_polluted_final - x_clean_final).norm().item()
 
@@ -525,6 +544,8 @@ def apply_obfuscation_from_artifacts(
     harmful_prompts: List[str],
     artifact_dir: str,
     cfg: ObfuscationConfig = ObfuscationConfig(),
+    harmless_prompts: Optional[List[str]] = None,
+    ablation_scores: Optional[List[Dict]] = None,
 ) -> Dict:
     """
     Load ``direction.pt``, ``mean_diffs.pt``, and ``direction_metadata.json``
@@ -540,14 +561,23 @@ def apply_obfuscation_from_artifacts(
     )
     with open(os.path.join(artifact_dir, "direction_metadata.json")) as f:
         meta = json.load(f)
+    if ablation_scores is None:
+        ablation_scores_path = os.path.join(
+            artifact_dir, "select_direction", "direction_evaluations.json"
+        )
+        if os.path.exists(ablation_scores_path):
+            with open(ablation_scores_path) as f:
+                ablation_scores = json.load(f)
 
     return apply_obfuscation(
         model=model,
         tokenize_fn=tokenize_fn,
         harmful_prompts=harmful_prompts,
+        harmless_prompts=harmless_prompts,
         mean_diffs=mean_diffs,
         selected_pos=meta["pos"],
         selected_layer=meta["layer"],
         direction=direction,
         cfg=cfg,
+        ablation_scores=ablation_scores,
     )
