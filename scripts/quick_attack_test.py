@@ -27,7 +27,7 @@ from pipeline.submodules.generate_directions import generate_directions
 from pipeline.submodules.select_direction import select_direction
 from apply_obfuscation import apply_obfuscation
 from obfuscation_config import ObfuscationConfig
-from run_obfuscation_pipeline import load_mlabonne_datasets, filter_data
+from run_obfuscation_pipeline import load_mlabonne_datasets
 from attacks.evaluate_abliteration import evaluate_abliteration_resistance
 from attacks.evaluate_adaptive_attack import pca_multi_direction_attack
 
@@ -96,11 +96,9 @@ def run(model_key: str, n_prompts: int):
         )
 
     harmful_train, harmless_train, harmful_val, harmless_val = load_mlabonne_datasets(
-        n_train=400, n_val=100
+        n_train=128, n_val=50
     )
-    harmful_train, harmless_train, harmful_val, harmless_val = filter_data(
-        model_base, harmful_train, harmless_train, harmful_val, harmless_val
-    )
+    # skip filter_data — saves ~2GB peak memory, fine for a quick attack test
 
     # Direction extraction
     print("\nExtracting refusal direction …")
@@ -117,7 +115,7 @@ def run(model_key: str, n_prompts: int):
     cfg = ObfuscationConfig(
         epsilon=epsilon,
         num_pertinent_layers=num_layers,
-        num_calibration_prompts=128,
+        num_calibration_prompts=64,
         seed=42,
         projection_mode="full",
         per_layer_direction=True,
