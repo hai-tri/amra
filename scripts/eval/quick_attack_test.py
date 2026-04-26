@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """
-quick_attack_test.py — Local Mac smoke test for Arditi abliteration + PCA-8 attack.
+quick_attack_test.py — Attack resistance + utility evaluation at best APRS configs.
 
 Correct threat model:
   1. Extract refusal direction from *undefended* model.
   2. Filter to harmful prompts the base model actually refuses (score > 0).
-  3. Undefended baseline: apply Arditi abliteration on original direction
-     → model should STOP refusing (attack works on undefended model).
-  4. Apply APRS defense (weight edits).
-  5. Defended baseline: abliterate using direction re-extracted from defended
-     model's activations → model should STILL refuse (defense holds).
-  6. PCA-8 variant: same but with top-8 principal components.
+  3. Measure refusal + utility on all 6 conditions:
+       Undefended baseline | + Arditi | + PCA-8
+       Defended baseline   | + Arditi | + PCA-8
+
+Metrics per condition: refusal score, Pile BPB, MMLU, MATH500.
 
 Usage:
-    python scripts/quick_attack_test.py [--model llama|qwen|gemma|all] [--n 20]
+    python scripts/eval/quick_attack_test.py [--model llama|qwen|gemma|all] [--n 20]
+    python scripts/eval/quick_attack_test.py --skip_utility          # ASR only, fast
+    python scripts/eval/quick_attack_test.py --bpb_batches 64 --mmlu_n 500 --math500_n 500
 """
 
 import argparse
+import csv
+import datetime
 import functools
 import math
 import os
@@ -29,18 +32,18 @@ sys.path.insert(0, REPO_DIR)
 sys.path.insert(0, os.path.join(REPO_DIR, "refusal_direction"))
 
 from pipeline.model_utils.model_factory import construct_model_base
-from pipeline.submodules.generate_directions import generate_directions
+from pipeline.submodules.generate_directions import generate_directions, get_mean_activations
 from pipeline.submodules.select_direction import select_direction, get_refusal_scores
 from pipeline.submodules.evaluate_loss import evaluate_loss
 from pipeline.utils.hook_utils import (
+    add_hooks,
     get_direction_ablation_input_pre_hook,
     get_direction_ablation_output_hook,
 )
 from apply_obfuscation import apply_obfuscation
 from obfuscation_config import ObfuscationConfig
 from run_obfuscation_pipeline import load_mlabonne_datasets, filter_data
-from attacks.evaluate_abliteration import evaluate_abliteration_resistance, extract_refusal_direction
-from attacks.evaluate_adaptive_attack import pca_multi_direction_attack
+from attacks.evaluate_abliteration import evaluate_abliteration_resistance
 from benchmarks.evaluate_lm_harness import run_lm_harness
 
 SYSTEM_PROMPT = "You are a helpful assistant."
@@ -61,6 +64,26 @@ _SNAPSHOT_KEYS = frozenset(
      "gate_proj", "up_proj", "lm_head"]
 )
 
+CSV_FIELDS = [
+    "model", "epsilon", "num_layers", "avg_cos_sim",
+    # refusal scores
+    "ref_undef_base", "ref_undef_arditi", "ref_undef_pca8",
+    "ref_def_base",   "ref_def_arditi",   "ref_def_pca8",
+    # pile bpb
+    "bpb_undef_base", "bpb_undef_arditi", "bpb_undef_pca8",
+    "bpb_def_base",   "bpb_def_arditi",   "bpb_def_pca8",
+    # mmlu
+    "mmlu_undef_base", "mmlu_undef_arditi", "mmlu_undef_pca8",
+    "mmlu_def_base",   "mmlu_def_arditi",   "mmlu_def_pca8",
+    # math500
+    "math500_undef_base", "math500_undef_arditi", "math500_undef_pca8",
+    "math500_def_base",   "math500_def_arditi",   "math500_def_pca8",
+]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Helpers
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _save(model):
     return {n: p.data.clone() for n, p in model.named_parameters()
@@ -74,31 +97,83 @@ def _restore(model, snap):
                 p.data.copy_(snap[n])
 
 
+def _fmt(v):
+    return f"{v:.4f}" if v is not None else "N/A"
+
+
 def _refusal_rate(scores):
     return (scores > 0).float().mean().item()
 
 
 def _build_arditi_hooks(block_modules, attn_modules, mlp_modules, direction):
-    """Build forward hooks that project out `direction` at every layer."""
     num_layers = len(block_modules)
     fwd_pre_hooks = [
         (block_modules[ell], get_direction_ablation_input_pre_hook(direction=direction))
         for ell in range(num_layers)
     ]
-    fwd_hooks = [
-        (attn_modules[ell], get_direction_ablation_output_hook(direction=direction))
-        for ell in range(num_layers)
-    ] + [
-        (mlp_modules[ell], get_direction_ablation_output_hook(direction=direction))
-        for ell in range(num_layers)
-    ]
+    fwd_hooks = (
+        [(attn_modules[ell], get_direction_ablation_output_hook(direction=direction))
+         for ell in range(num_layers)] +
+        [(mlp_modules[ell],  get_direction_ablation_output_hook(direction=direction))
+         for ell in range(num_layers)]
+    )
+    return fwd_pre_hooks, fwd_hooks
+
+
+def _extract_pca_directions(
+    model, tokenizer, tokenize_fn, block_modules,
+    harmful_prompts, benign_prompts,
+    top_k=8, batch_size=4,
+    base_fwd_pre_hooks=None, base_fwd_hooks=None,
+):
+    """Return (top_k_directions, singular_values) from diff-in-means PCA."""
+    base_fwd_pre_hooks = base_fwd_pre_hooks or []
+    base_fwd_hooks     = base_fwd_hooks     or []
+    with add_hooks(base_fwd_pre_hooks, base_fwd_hooks):
+        mean_harmful = get_mean_activations(
+            model, tokenizer, harmful_prompts, tokenize_fn,
+            block_modules, batch_size=batch_size, positions=[-1],
+        )
+        mean_benign = get_mean_activations(
+            model, tokenizer, benign_prompts, tokenize_fn,
+            block_modules, batch_size=batch_size, positions=[-1],
+        )
+    mean_diffs = (mean_harmful - mean_benign).squeeze(0)       # (n_layers, d_model)
+    centered   = mean_diffs - mean_diffs.mean(dim=0, keepdim=True)
+    _, S, Vh   = torch.linalg.svd(centered.float(), full_matrices=False)
+    return Vh[:top_k], S[:top_k]
+
+
+def _build_pca_hooks(block_modules, attn_modules, mlp_modules, top_k_directions):
+    num_layers = len(block_modules)
+
+    def _pre_hook(module, inp):
+        x = inp[0] if isinstance(inp, tuple) else inp
+        for d in top_k_directions:
+            d = d.to(x) / (d.to(x).norm() + 1e-8)
+            x = x - (x @ d).unsqueeze(-1) * d
+        return (x, *inp[1:]) if isinstance(inp, tuple) else x
+
+    def _out_hook(module, inp, out):
+        x = out[0] if isinstance(out, tuple) else out
+        for d in top_k_directions:
+            d = d.to(x) / (d.to(x).norm() + 1e-8)
+            x = x - (x @ d).unsqueeze(-1) * d
+        return (x, *out[1:]) if isinstance(out, tuple) else x
+
+    fwd_pre_hooks = [(block_modules[ell], _pre_hook) for ell in range(num_layers)]
+    fwd_hooks = (
+        [(attn_modules[ell], _out_hook) for ell in range(num_layers)] +
+        [(mlp_modules[ell],  _out_hook) for ell in range(num_layers)]
+    )
     return fwd_pre_hooks, fwd_hooks
 
 
 def _measure_utility(model_base, fwd_pre_hooks, fwd_hooks,
-                     n_batches_bpb=32, n_samples_mmlu=200, batch_size=8):
-    """Return (pile_bpb, mmlu_acc) under the given hooks."""
-    bpb_result = evaluate_loss(
+                     n_batches_bpb=32, mmlu_n=200, math500_n=200,
+                     batch_size=8):
+    """Return dict with pile_bpb, mmlu_acc, math500_acc under given hooks."""
+    bpb_res = evaluate_loss(
         model_base,
         fwd_pre_hooks=fwd_pre_hooks,
         fwd_hooks=fwd_hooks,
@@ -106,32 +181,32 @@ def _measure_utility(model_base, fwd_pre_hooks, fwd_hooks,
         n_batches=n_batches_bpb,
         dataset_labels=["pile"],
     )
-    # server's evaluate_loss returns ce_loss (nats); convert to bits-per-byte
-    pile_bpb = bpb_result["pile"].get("bpb") or \
-               bpb_result["pile"]["ce_loss"] / math.log(2)
+    pile = bpb_res["pile"]
+    pile_bpb = pile.get("bpb") or pile["ce_loss"] / math.log(2)
 
-    lm_result = run_lm_harness(
+    lm_res = run_lm_harness(
         model=model_base.model,
         tokenizer=model_base.tokenizer,
-        tasks=["mmlu"],
-        n_samples=n_samples_mmlu,
+        tasks=["mmlu", "math500"],
+        n_samples=max(mmlu_n, math500_n),
         batch_size=batch_size,
         seed=42,
         fwd_pre_hooks=fwd_pre_hooks,
         fwd_hooks=fwd_hooks,
     )
-    mmlu_acc = lm_result.get("mmlu", {}).get("acc")
-    return pile_bpb, mmlu_acc
+    mmlu_acc    = lm_res.get("mmlu",    {}).get("acc")
+    math500_acc = lm_res.get("math500", {}).get("exact_match")
+
+    return {"bpb": pile_bpb, "mmlu": mmlu_acc, "math500": math500_acc}
 
 
-def run(
-    model_key: str,
-    n_prompts: int,
-    skip_utility: bool = False,
-    utility_batch_size: int = 1,
-    utility_bpb_batches: int = 8,
-    utility_mmlu_n: int = 25,
-):
+# ──────────────────────────────────────────────────────────────────────────────
+# Main evaluation loop
+# ──────────────────────────────────────────────────────────────────────────────
+
+def run(model_key: str, n_prompts: int, skip_utility: bool,
+        bpb_batches: int, mmlu_n: int, math500_n: int, batch_size: int):
+
     model_id, epsilon, num_layers = CONFIGS[model_key]
     model_tag = os.path.basename(model_id).lower()
 
@@ -140,142 +215,112 @@ def run(
     print(f"{'='*60}")
 
     model_base = construct_model_base(model_id)
-    _is_qwen3 = "qwen3" in model_id.lower()
-    _is_gemma = "gemma" in model_id.lower()
+    _is_qwen3  = "qwen3" in model_id.lower()
+    _is_gemma  = "gemma" in model_id.lower()
 
     if _is_qwen3:
         _tok = model_base.tokenizer
-        _orig_apply = _tok.apply_chat_template
-        def _no_think_apply(messages, **kwargs):
-            kwargs.setdefault("enable_thinking", False)
-            return _orig_apply(messages, **kwargs)
-        _tok.apply_chat_template = _no_think_apply
-
-        def _qwen3_tokenize(instructions, outputs=None, system=None):
+        _orig = _tok.apply_chat_template
+        def _no_think(messages, **kw):
+            kw.setdefault("enable_thinking", False)
+            return _orig(messages, **kw)
+        _tok.apply_chat_template = _no_think
+        def _qwen3_tok(instructions, outputs=None, system=None):
             prompts = [_QWEN3_TEMPLATE.format(instruction=i) for i in instructions]
             if outputs is not None:
                 prompts = [p + o for p, o in zip(prompts, outputs)]
             return _tok(prompts, padding=True, truncation=False, return_tensors="pt")
-        model_base.tokenize_instructions_fn = functools.partial(
-            _qwen3_tokenize, system=SYSTEM_PROMPT
-        )
+        model_base.tokenize_instructions_fn = functools.partial(_qwen3_tok, system=SYSTEM_PROMPT)
     elif not _is_gemma:
         model_base.tokenize_instructions_fn = functools.partial(
-            model_base.tokenize_instructions_fn, system=SYSTEM_PROMPT
-        )
+            model_base.tokenize_instructions_fn, system=SYSTEM_PROMPT)
 
+    # ── Data ─────────────────────────────────────────────────────────────────
     harmful_train, harmless_train, harmful_val, harmless_val = load_mlabonne_datasets(
-        n_train=400, n_val=100
-    )
-
-    # Keep only examples the base model responds to correctly
-    print("\nFiltering examples with base model …")
+        n_train=400, n_val=100)
+    print("\nFiltering with base model …")
     harmful_train, harmless_train, harmful_val, harmless_val = filter_data(
-        model_base, harmful_train, harmless_train, harmful_val, harmless_val
-    )
+        model_base, harmful_train, harmless_train, harmful_val, harmless_val)
     print(f"  harmful_train={len(harmful_train)}  harmless_train={len(harmless_train)}")
-    print(f"  harmful_val={len(harmful_val)}  harmless_val={len(harmless_val)}")
+    print(f"  harmful_val={len(harmful_val)}    harmless_val={len(harmless_val)}")
 
-    # Direction extraction from undefended model
+    # ── Direction extraction (undefended) ────────────────────────────────────
     print("\nExtracting refusal direction from undefended model …")
     with tempfile.TemporaryDirectory() as _tmp:
-        mean_diffs = generate_directions(
-            model_base, harmful_train, harmless_train, artifact_dir=_tmp,
-        )
+        mean_diffs_train = generate_directions(
+            model_base, harmful_train, harmless_train, artifact_dir=_tmp)
         pos, layer, direction = select_direction(
-            model_base, harmful_val, harmless_val, mean_diffs, artifact_dir=_tmp,
-        )
+            model_base, harmful_val, harmless_val, mean_diffs_train, artifact_dir=_tmp)
     print(f"Direction: pos={pos}, layer={layer}, ||r||={direction.norm():.4f}")
 
     harmful_test  = harmful_val[:n_prompts]
     harmless_test = harmless_val[:n_prompts]
 
-    # ----------------------------------------------------------------
-    # Phase 1: Undefended model + abliteration (should stop refusing)
-    # ----------------------------------------------------------------
+    # ── Helper: refusal score under hooks ────────────────────────────────────
+    def _refusal(pre, post):
+        s = get_refusal_scores(
+            model_base.model, harmful_test,
+            model_base.tokenize_instructions_fn, model_base.refusal_toks,
+            fwd_pre_hooks=pre, fwd_hooks=post, batch_size=4,
+        )
+        return s.mean().item()
+
+    # ── Phase 1: UNDEFENDED ──────────────────────────────────────────────────
     print("\n" + "─"*50)
     print(" Phase 1: UNDEFENDED model")
     print("─"*50)
 
-    baseline_scores_undefended = get_refusal_scores(
-        model_base.model, harmful_test,
-        model_base.tokenize_instructions_fn, model_base.refusal_toks,
-        batch_size=4,
-    )
-    baseline_mean_undefended = baseline_scores_undefended.mean().item()
-    baseline_rate_undefended = _refusal_rate(baseline_scores_undefended)
-    print(f"  Baseline refusal: score={baseline_mean_undefended:.4f}  "
-          f"rate={baseline_rate_undefended:.2%}")
+    ref_undef_base = _refusal([], [])
+    print(f"  Baseline refusal score: {ref_undef_base:.4f}")
 
-    undef_bpb_base = undef_mmlu_base = None
-    if not skip_utility:
-        print("  Measuring undefended utility (no attack) …")
-        undef_bpb_base, undef_mmlu_base = _measure_utility(
-            model_base, [], [],
-            n_batches_bpb=utility_bpb_batches,
-            n_samples_mmlu=utility_mmlu_n,
-            batch_size=utility_batch_size,
-        )
-
-    undefended_arditi = evaluate_abliteration_resistance(
-        model=model_base.model,
-        tokenizer=model_base.tokenizer,
+    # Arditi direction from undefended model
+    undef_arditi_res = evaluate_abliteration_resistance(
+        model=model_base.model, tokenizer=model_base.tokenizer,
         tokenize_fn=model_base.tokenize_instructions_fn,
         block_modules=model_base.model_block_modules,
         attn_modules=model_base.model_attn_modules,
         mlp_modules=model_base.model_mlp_modules,
-        harmful_prompts=harmful_test,
-        benign_prompts=harmless_test,
-        original_direction=direction,
-        refusal_toks=model_base.refusal_toks,
+        harmful_prompts=harmful_test, benign_prompts=harmless_test,
+        original_direction=direction, refusal_toks=model_base.refusal_toks,
         batch_size=4,
     )
+    ref_undef_arditi = undef_arditi_res["arditi_refusal_score"]
+    ua_pre, ua_post = _build_arditi_hooks(
+        model_base.model_block_modules, model_base.model_attn_modules,
+        model_base.model_mlp_modules, undef_arditi_res["defended_direction"])
 
-    # Build Arditi hooks from the direction the attacker extracted
-    undef_arditi_dir = undefended_arditi["defended_direction"]
-    undef_arditi_pre, undef_arditi_post = _build_arditi_hooks(
-        model_base.model_block_modules,
-        model_base.model_attn_modules,
-        model_base.model_mlp_modules,
-        undef_arditi_dir,
+    # PCA-8 direction from undefended model
+    print("  Extracting PCA-8 directions (undefended) …")
+    undef_pca_dirs, undef_pca_svals = _extract_pca_directions(
+        model_base.model, model_base.tokenizer,
+        model_base.tokenize_instructions_fn, model_base.model_block_modules,
+        harmful_test, harmless_test, top_k=8, batch_size=4,
     )
-    undef_bpb_arditi = undef_mmlu_arditi = None
+    print(f"  Top-8 singular values: {[f'{s:.1f}' for s in undef_pca_svals.tolist()]}")
+    up_pre, up_post = _build_pca_hooks(
+        model_base.model_block_modules, model_base.model_attn_modules,
+        model_base.model_mlp_modules, undef_pca_dirs)
+    ref_undef_pca8 = _refusal(up_pre, up_post)
+    print(f"  Arditi post-abliteration: {ref_undef_arditi:.4f}")
+    print(f"  PCA-8  post-abliteration: {ref_undef_pca8:.4f}")
+
+    util_undef_base   = util_undef_arditi = util_undef_pca8 = None
     if not skip_utility:
-        print("  Measuring undefended utility under Arditi abliteration …")
-        undef_bpb_arditi, undef_mmlu_arditi = _measure_utility(
-            model_base, undef_arditi_pre, undef_arditi_post,
-            n_batches_bpb=utility_bpb_batches,
-            n_samples_mmlu=utility_mmlu_n,
-            batch_size=utility_batch_size,
-        )
+        print("  Measuring utility — undefended baseline …")
+        util_undef_base   = _measure_utility(model_base, [], [],
+                                             bpb_batches, mmlu_n, math500_n, batch_size)
+        print("  Measuring utility — undefended + Arditi …")
+        util_undef_arditi = _measure_utility(model_base, ua_pre, ua_post,
+                                             bpb_batches, mmlu_n, math500_n, batch_size)
+        print("  Measuring utility — undefended + PCA-8 …")
+        util_undef_pca8   = _measure_utility(model_base, up_pre, up_post,
+                                             bpb_batches, mmlu_n, math500_n, batch_size)
 
-    undefended_pca = pca_multi_direction_attack(
-        model=model_base.model,
-        tokenizer=model_base.tokenizer,
-        tokenize_fn=model_base.tokenize_instructions_fn,
-        block_modules=model_base.model_block_modules,
-        attn_modules=model_base.model_attn_modules,
-        mlp_modules=model_base.model_mlp_modules,
-        harmful_prompts=harmful_test,
-        benign_prompts=harmless_test,
-        refusal_toks=model_base.refusal_toks,
-        top_k=8,
-        batch_size=4,
-    )
-
-    print(f"  Arditi post-abliteration: score={undefended_arditi['arditi_refusal_score']:.4f}")
-    print(f"  PCA-8  post-abliteration: score={undefended_pca['post_attack_refusal_score']:.4f}")
-
-    # ----------------------------------------------------------------
-    # Phase 2: APRS defense + abliteration (should still refuse)
-    # ----------------------------------------------------------------
+    # ── Phase 2: DEFENDED ────────────────────────────────────────────────────
     cfg = ObfuscationConfig(
-        epsilon=epsilon,
-        num_pertinent_layers=num_layers,
-        num_calibration_prompts=64,
-        seed=42,
-        projection_mode="full",
-        per_layer_direction=True,
+        epsilon=epsilon, num_pertinent_layers=num_layers,
+        num_calibration_prompts=64, seed=42,
+        projection_mode="full", per_layer_direction=True,
         writer_output_directions=True,
     )
     snap = _save(model_base.model)
@@ -286,12 +331,10 @@ def run(
         obf = apply_obfuscation(
             model=model_base.model,
             tokenize_fn=model_base.tokenize_instructions_fn,
-            harmful_prompts=harmful_train,
-            harmless_prompts=harmless_train,
-            mean_diffs=mean_diffs,
+            harmful_prompts=harmful_train, harmless_prompts=harmless_train,
+            mean_diffs=mean_diffs_train,
             selected_pos=pos, selected_layer=layer,
-            direction=direction, cfg=cfg,
-            ablation_scores=None,
+            direction=direction, cfg=cfg, ablation_scores=None,
         )
         pertinent = obf["pertinent_layers"]
         print(f"Pertinent layers ({len(pertinent)}): {sorted(pertinent)}")
@@ -300,123 +343,105 @@ def run(
         print(" Phase 2: DEFENDED model")
         print("─"*50)
 
-        baseline_scores_defended = get_refusal_scores(
-            model_base.model, harmful_test,
-            model_base.tokenize_instructions_fn, model_base.refusal_toks,
-            batch_size=4,
-        )
-        baseline_mean_defended = baseline_scores_defended.mean().item()
-        baseline_rate_defended = _refusal_rate(baseline_scores_defended)
-        print(f"  Baseline refusal: score={baseline_mean_defended:.4f}  "
-              f"rate={baseline_rate_defended:.2%}")
+        ref_def_base = _refusal([], [])
+        print(f"  Baseline refusal score: {ref_def_base:.4f}")
 
-        def_bpb_base = def_mmlu_base = None
-        if not skip_utility:
-            print("  Measuring defended utility (no attack) …")
-            def_bpb_base, def_mmlu_base = _measure_utility(
-                model_base, [], [],
-                n_batches_bpb=utility_bpb_batches,
-                n_samples_mmlu=utility_mmlu_n,
-                batch_size=utility_batch_size,
-            )
-
-        defended_arditi = evaluate_abliteration_resistance(
-            model=model_base.model,
-            tokenizer=model_base.tokenizer,
+        # Arditi direction from defended model
+        def_arditi_res = evaluate_abliteration_resistance(
+            model=model_base.model, tokenizer=model_base.tokenizer,
             tokenize_fn=model_base.tokenize_instructions_fn,
             block_modules=model_base.model_block_modules,
             attn_modules=model_base.model_attn_modules,
             mlp_modules=model_base.model_mlp_modules,
-            harmful_prompts=harmful_test,
-            benign_prompts=harmless_test,
-            original_direction=direction,
-            refusal_toks=model_base.refusal_toks,
-            batch_size=4,
-            pertinent_layers=list(pertinent),
+            harmful_prompts=harmful_test, benign_prompts=harmless_test,
+            original_direction=direction, refusal_toks=model_base.refusal_toks,
+            batch_size=4, pertinent_layers=list(pertinent),
         )
+        ref_def_arditi = def_arditi_res["arditi_refusal_score"]
+        avg_cos_sim    = def_arditi_res["mean_cos_sim"]
+        da_pre, da_post = _build_arditi_hooks(
+            model_base.model_block_modules, model_base.model_attn_modules,
+            model_base.model_mlp_modules, def_arditi_res["defended_direction"])
 
-        def_arditi_dir = defended_arditi["defended_direction"]
-        def_arditi_pre, def_arditi_post = _build_arditi_hooks(
-            model_base.model_block_modules,
-            model_base.model_attn_modules,
-            model_base.model_mlp_modules,
-            def_arditi_dir,
+        # PCA-8 direction from defended model
+        print("  Extracting PCA-8 directions (defended) …")
+        def_pca_dirs, def_pca_svals = _extract_pca_directions(
+            model_base.model, model_base.tokenizer,
+            model_base.tokenize_instructions_fn, model_base.model_block_modules,
+            harmful_test, harmless_test, top_k=8, batch_size=4,
         )
-        def_bpb_arditi = def_mmlu_arditi = None
+        print(f"  Top-8 singular values: {[f'{s:.1f}' for s in def_pca_svals.tolist()]}")
+        dp_pre, dp_post = _build_pca_hooks(
+            model_base.model_block_modules, model_base.model_attn_modules,
+            model_base.model_mlp_modules, def_pca_dirs)
+        ref_def_pca8 = _refusal(dp_pre, dp_post)
+        print(f"  Arditi post-abliteration: {ref_def_arditi:.4f}")
+        print(f"  PCA-8  post-abliteration: {ref_def_pca8:.4f}")
+        print(f"  avg_cos_sim: {avg_cos_sim:.4f}")
+
+        util_def_base   = util_def_arditi = util_def_pca8 = None
         if not skip_utility:
-            print("  Measuring defended utility under Arditi abliteration …")
-            def_bpb_arditi, def_mmlu_arditi = _measure_utility(
-                model_base, def_arditi_pre, def_arditi_post,
-                n_batches_bpb=utility_bpb_batches,
-                n_samples_mmlu=utility_mmlu_n,
-                batch_size=utility_batch_size,
-            )
+            print("  Measuring utility — defended baseline …")
+            util_def_base   = _measure_utility(model_base, [], [],
+                                               bpb_batches, mmlu_n, math500_n, batch_size)
+            print("  Measuring utility — defended + Arditi …")
+            util_def_arditi = _measure_utility(model_base, da_pre, da_post,
+                                               bpb_batches, mmlu_n, math500_n, batch_size)
+            print("  Measuring utility — defended + PCA-8 …")
+            util_def_pca8   = _measure_utility(model_base, dp_pre, dp_post,
+                                               bpb_batches, mmlu_n, math500_n, batch_size)
 
-        defended_pca = pca_multi_direction_attack(
-            model=model_base.model,
-            tokenizer=model_base.tokenizer,
-            tokenize_fn=model_base.tokenize_instructions_fn,
-            block_modules=model_base.model_block_modules,
-            attn_modules=model_base.model_attn_modules,
-            mlp_modules=model_base.model_mlp_modules,
-            harmful_prompts=harmful_test,
-            benign_prompts=harmless_test,
-            refusal_toks=model_base.refusal_toks,
-            top_k=8,
-            batch_size=4,
-        )
-
-        def _f(v):
-            return f"{v:.4f}" if v is not None else "N/A"
+        # ── Results table ────────────────────────────────────────────────────
+        def _u(d, k):
+            return d[k] if d is not None else None
 
         print(f"\n{'='*60}")
         print(f" RESULTS — {model_tag}")
         print(f"{'='*60}")
-        print(f"  {'':35s} {'ref_score':>9} {'pile_bpb':>9} {'mmlu':>7}")
-        print(f"  {'─'*62}")
-        print(f"  {'Undefended baseline':35s} "
-              f"{baseline_mean_undefended:>9.4f} "
-              f"{_f(undef_bpb_base):>9} "
-              f"{_f(undef_mmlu_base):>7}")
-        print(f"  {'Undefended + Arditi abliteration':35s} "
-              f"{undefended_arditi['arditi_refusal_score']:>9.4f} "
-              f"{_f(undef_bpb_arditi):>9} "
-              f"{_f(undef_mmlu_arditi):>7}")
-        print(f"  {'Undefended + PCA-8 abliteration':35s} "
-              f"{undefended_pca['post_attack_refusal_score']:>9.4f} "
-              f"{'—':>9} {'—':>7}")
-        print(f"  {'─'*62}")
-        print(f"  {'Defended baseline':35s} "
-              f"{baseline_mean_defended:>9.4f} "
-              f"{_f(def_bpb_base):>9} "
-              f"{_f(def_mmlu_base):>7}")
-        print(f"  {'Defended + Arditi abliteration':35s} "
-              f"{defended_arditi['arditi_refusal_score']:>9.4f} "
-              f"{_f(def_bpb_arditi):>9} "
-              f"{_f(def_mmlu_arditi):>7}")
-        print(f"  {'Defended + PCA-8 abliteration':35s} "
-              f"{defended_pca['post_attack_refusal_score']:>9.4f} "
-              f"{'—':>9} {'—':>7}")
-        print(f"  avg_cos_sim (defended vs original dir): "
-              f"{defended_arditi['mean_cos_sim']:.4f}")
+        print(f"  {'Condition':<35} {'ref_score':>9} {'pile_bpb':>9} {'mmlu':>7} {'math500':>8}")
+        print(f"  {'─'*70}")
+        rows_display = [
+            ("Undefended baseline",       ref_undef_base,  util_undef_base),
+            ("Undefended + Arditi",        ref_undef_arditi, util_undef_arditi),
+            ("Undefended + PCA-8",         ref_undef_pca8,  util_undef_pca8),
+            ("Defended baseline",          ref_def_base,    util_def_base),
+            ("Defended + Arditi",          ref_def_arditi,  util_def_arditi),
+            ("Defended + PCA-8",           ref_def_pca8,    util_def_pca8),
+        ]
+        for label, ref, util in rows_display:
+            bpb = _fmt(_u(util, "bpb"))   if util else "—"
+            mmlu = _fmt(_u(util, "mmlu")) if util else "—"
+            m5   = _fmt(_u(util, "math500")) if util else "—"
+            print(f"  {label:<35} {ref:>9.4f} {bpb:>9} {mmlu:>7} {m5:>8}")
+        print(f"  avg_cos_sim (defended vs original): {avg_cos_sim:.4f}")
 
         return {
-            "model":               model_tag,
-            "undef_baseline":      baseline_mean_undefended,
-            "undef_arditi":        undefended_arditi["arditi_refusal_score"],
-            "undef_pca8":          undefended_pca["post_attack_refusal_score"],
-            "undef_bpb_base":      undef_bpb_base,
-            "undef_bpb_arditi":    undef_bpb_arditi,
-            "undef_mmlu_base":     undef_mmlu_base,
-            "undef_mmlu_arditi":   undef_mmlu_arditi,
-            "def_baseline":        baseline_mean_defended,
-            "def_arditi":          defended_arditi["arditi_refusal_score"],
-            "def_pca8":            defended_pca["post_attack_refusal_score"],
-            "def_bpb_base":        def_bpb_base,
-            "def_bpb_arditi":      def_bpb_arditi,
-            "def_mmlu_base":       def_mmlu_base,
-            "def_mmlu_arditi":     def_mmlu_arditi,
-            "avg_cos_sim":         defended_arditi["mean_cos_sim"],
+            "model": model_tag, "epsilon": epsilon, "num_layers": num_layers,
+            "avg_cos_sim": avg_cos_sim,
+            "ref_undef_base":   ref_undef_base,
+            "ref_undef_arditi": ref_undef_arditi,
+            "ref_undef_pca8":   ref_undef_pca8,
+            "ref_def_base":     ref_def_base,
+            "ref_def_arditi":   ref_def_arditi,
+            "ref_def_pca8":     ref_def_pca8,
+            "bpb_undef_base":   _u(util_undef_base,   "bpb"),
+            "bpb_undef_arditi": _u(util_undef_arditi, "bpb"),
+            "bpb_undef_pca8":   _u(util_undef_pca8,   "bpb"),
+            "bpb_def_base":     _u(util_def_base,     "bpb"),
+            "bpb_def_arditi":   _u(util_def_arditi,   "bpb"),
+            "bpb_def_pca8":     _u(util_def_pca8,     "bpb"),
+            "mmlu_undef_base":   _u(util_undef_base,   "mmlu"),
+            "mmlu_undef_arditi": _u(util_undef_arditi, "mmlu"),
+            "mmlu_undef_pca8":   _u(util_undef_pca8,   "mmlu"),
+            "mmlu_def_base":     _u(util_def_base,     "mmlu"),
+            "mmlu_def_arditi":   _u(util_def_arditi,   "mmlu"),
+            "mmlu_def_pca8":     _u(util_def_pca8,     "mmlu"),
+            "math500_undef_base":   _u(util_undef_base,   "math500"),
+            "math500_undef_arditi": _u(util_undef_arditi, "math500"),
+            "math500_undef_pca8":   _u(util_undef_pca8,   "math500"),
+            "math500_def_base":     _u(util_def_base,     "math500"),
+            "math500_def_arditi":   _u(util_def_arditi,   "math500"),
+            "math500_def_pca8":     _u(util_def_pca8,     "math500"),
         }
 
     finally:
@@ -428,101 +453,89 @@ def run(
             torch.mps.empty_cache()
 
 
+# ──────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────────────────────────────────────
+
 def main():
     pa = argparse.ArgumentParser()
-    pa.add_argument("--model", choices=["llama", "qwen", "gemma", "all"],
-                    default="all")
+    pa.add_argument("--model", choices=["llama", "qwen", "gemma", "all"], default="all")
     pa.add_argument("--n", type=int, default=20,
-                    help="Harmful/harmless prompts for attack eval")
+                    help="Harmful/harmless prompts for attack eval (default: 20)")
     pa.add_argument("--skip_utility", action="store_true",
-                    help="Skip BPB/MMLU utility probes; run only refusal/ASR checks")
-    pa.add_argument("--utility_batch_size", type=int, default=1,
-                    help="Batch size for optional utility probes (default: 1)")
-    pa.add_argument("--utility_bpb_batches", type=int, default=8,
-                    help="Pile BPB batches for optional utility probes (default: 8)")
-    pa.add_argument("--utility_mmlu_n", type=int, default=25,
-                    help="MMLU examples for optional utility probes (default: 25)")
+                    help="Skip BPB/MMLU/MATH500 utility probes")
+    pa.add_argument("--bpb_batches", type=int, default=32,
+                    help="Pile BPB n_batches (default: 32)")
+    pa.add_argument("--mmlu_n", type=int, default=200,
+                    help="MMLU examples (default: 200)")
+    pa.add_argument("--math500_n", type=int, default=200,
+                    help="MATH500 examples (default: 200)")
+    pa.add_argument("--batch_size", type=int, default=8,
+                    help="Batch size for utility probes (default: 8)")
+    pa.add_argument("--output_dir", default=os.path.join(REPO_DIR, "results", "attack_utility"),
+                    help="Directory for CSV output")
     args = pa.parse_args()
 
     keys = list(CONFIGS.keys()) if args.model == "all" else [args.model]
     results = []
     for k in keys:
         try:
-            r = run(
-                k,
-                args.n,
-                skip_utility=args.skip_utility,
-                utility_batch_size=args.utility_batch_size,
-                utility_bpb_batches=args.utility_bpb_batches,
-                utility_mmlu_n=args.utility_mmlu_n,
-            )
+            r = run(k, args.n,
+                    skip_utility=args.skip_utility,
+                    bpb_batches=args.bpb_batches,
+                    mmlu_n=args.mmlu_n,
+                    math500_n=args.math500_n,
+                    batch_size=args.batch_size)
             if r:
                 results.append(r)
         except Exception as e:
             print(f"[ERROR] {k}: {e}")
             import traceback; traceback.print_exc()
 
-    if results:
-        def _f(v):
-            return f"{v:.4f}" if v is not None else "N/A"
+    if not results:
+        return
 
+    # ── Summary tables ───────────────────────────────────────────────────────
+    conditions = [
+        ("undef_base",   "Undef baseline"),
+        ("undef_arditi", "Undef+Arditi"),
+        ("undef_pca8",   "Undef+PCA-8"),
+        ("def_base",     "Def baseline"),
+        ("def_arditi",   "Def+Arditi"),
+        ("def_pca8",     "Def+PCA-8"),
+    ]
+
+    for metric, label, better in [
+        ("ref",     "Refusal score",         None),
+        ("bpb",     "Pile BPB",              "lower"),
+        ("mmlu",    "MMLU accuracy",         "higher"),
+        ("math500", "MATH500 exact match",   "higher"),
+    ]:
         print(f"\n{'='*60}")
-        print(" SUMMARY — Refusal scores")
+        print(f" {label}" + (f" ({better} = better)" if better else ""))
         print(f"{'='*60}")
-        hdr = f"{'Model':<30} {'undef_base':>10} {'undef_ard':>10} {'undef_pca':>10} {'def_base':>9} {'def_ard':>8} {'def_pca':>8} {'cos_sim':>8}"
+        cond_keys = [c[0] for c in conditions]
+        cond_labels = [c[1] for c in conditions]
+        hdr = f"{'Model':<28}" + "".join(f"{l:>12}" for l in cond_labels)
         print(hdr)
         print("─" * len(hdr))
         for r in results:
-            print(
-                f"{r['model']:<30} "
-                f"{r['undef_baseline']:>10.4f} "
-                f"{r['undef_arditi']:>10.4f} "
-                f"{r['undef_pca8']:>10.4f} "
-                f"{r['def_baseline']:>9.4f} "
-                f"{r['def_arditi']:>8.4f} "
-                f"{r['def_pca8']:>8.4f} "
-                f"{r['avg_cos_sim']:>8.4f}"
-            )
+            row = f"{r['model']:<28}"
+            for ck in cond_keys:
+                v = r.get(f"{metric}_{ck}")
+                row += f"{_fmt(v):>12}"
+            print(row)
 
-        print(f"\n{'='*60}")
-        print(" SUMMARY — Pile BPB (lower = better)")
-        print(f"{'='*60}")
-        hdr2 = f"{'Model':<30} {'undef_base':>10} {'undef+ard':>10} {'Δundef':>7} {'def_base':>9} {'def+ard':>8} {'Δdef':>6}"
-        print(hdr2)
-        print("─" * len(hdr2))
-        for r in results:
-            d_undef = r["undef_bpb_arditi"] - r["undef_bpb_base"]
-            d_def   = r["def_bpb_arditi"]   - r["def_bpb_base"]
-            print(
-                f"{r['model']:<30} "
-                f"{r['undef_bpb_base']:>10.4f} "
-                f"{r['undef_bpb_arditi']:>10.4f} "
-                f"{d_undef:>+7.4f} "
-                f"{r['def_bpb_base']:>9.4f} "
-                f"{r['def_bpb_arditi']:>8.4f} "
-                f"{d_def:>+6.4f}"
-            )
-
-        print(f"\n{'='*60}")
-        print(" SUMMARY — MMLU accuracy (higher = better)")
-        print(f"{'='*60}")
-        hdr3 = f"{'Model':<30} {'undef_base':>10} {'undef+ard':>10} {'Δundef':>7} {'def_base':>9} {'def+ard':>8} {'Δdef':>6}"
-        print(hdr3)
-        print("─" * len(hdr3))
-        for r in results:
-            ub, ua = r["undef_mmlu_base"], r["undef_mmlu_arditi"]
-            db, da = r["def_mmlu_base"],   r["def_mmlu_arditi"]
-            d_undef = (ua - ub) if (ua is not None and ub is not None) else None
-            d_def   = (da - db) if (da is not None and db is not None) else None
-            print(
-                f"{r['model']:<30} "
-                f"{_f(ub):>10} "
-                f"{_f(ua):>10} "
-                f"{(_f(d_undef) if d_undef is not None else 'N/A'):>7} "
-                f"{_f(db):>9} "
-                f"{_f(da):>8} "
-                f"{(_f(d_def) if d_def is not None else 'N/A'):>6}"
-            )
+    # ── CSV output ───────────────────────────────────────────────────────────
+    if not args.skip_utility:
+        os.makedirs(args.output_dir, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = os.path.join(args.output_dir, f"attack_utility_{ts}.csv")
+        with open(csv_path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=CSV_FIELDS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(results)
+        print(f"\nSaved → {csv_path}")
 
 
 if __name__ == "__main__":
