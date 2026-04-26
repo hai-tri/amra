@@ -41,7 +41,7 @@ chmod 600 ~/.cache/huggingface/token
 
 MODELS=(
     "meta-llama/Meta-Llama-3-8B-Instruct"
-    "Qwen/Qwen2.5-7B-Instruct"
+    "Qwen/Qwen3-8B"
     "google/gemma-2-9b-it"
     "mistralai/Mistral-7B-Instruct-v0.3"
     # Judges

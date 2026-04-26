@@ -87,6 +87,7 @@ def load_xstest_prompts(
 
 def evaluate_xstest(
     model,
+    tokenizer,
     tokenize_fn,
     fwd_pre_hooks: list = [],
     fwd_hooks: list = [],
@@ -139,7 +140,7 @@ def evaluate_xstest(
             prompt_len = input_ids.shape[1]
             for out in output_ids:
                 new_tokens = out[prompt_len:]
-                response_text = _decode(model, new_tokens)
+                response_text = _decode(tokenizer, new_tokens)
                 responses.append(response_text)
 
             print(f"[XSTest] {min(i + batch_size, len(prompts))}/{len(prompts)}")
@@ -185,9 +186,8 @@ def evaluate_xstest(
     return result
 
 
-def _decode(model, token_ids: torch.Tensor) -> str:
-    for attr in ("tokenizer", "_tokenizer"):
-        tok = getattr(model, attr, None)
-        if tok is not None:
-            return tok.decode(token_ids, skip_special_tokens=True)
-    return str(token_ids.tolist())
+def _decode(tokenizer, token_ids: torch.Tensor) -> str:
+    """Decode with the explicit tokenizer (no model-attribute fallback)."""
+    if tokenizer is None:
+        raise ValueError("tokenizer is required for response decoding")
+    return tokenizer.decode(token_ids, skip_special_tokens=True)

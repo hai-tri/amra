@@ -31,6 +31,7 @@ _DEFAULT_CSV = os.path.join(_ROOT, "data", "harmbench_behaviors_text_test.csv")
 
 def generate_responses_for_prompts(
     model,
+    tokenizer,
     tokenize_fn,
     prompts: List[str],
     fwd_pre_hooks: Optional[list] = None,
@@ -38,7 +39,13 @@ def generate_responses_for_prompts(
     max_new_tokens: int = 256,
     batch_size: int = 4,
 ) -> List[str]:
-    """Generate deterministic responses for prompts under optional hooks."""
+    """Generate deterministic responses for prompts under optional hooks.
+
+    ``tokenizer`` is required — earlier versions tried to read it off the
+    model (``model.tokenizer`` / ``model._tokenizer``), which silently
+    failed on plain HF models and caused responses to decode as the string
+    representation of their token-id list.
+    """
     from pipeline.utils.hook_utils import add_hooks
 
     if fwd_pre_hooks is None:
@@ -69,7 +76,7 @@ def generate_responses_for_prompts(
             for out in output_ids:
                 prompt_len = input_ids.shape[1]
                 new_tokens = out[prompt_len:]
-                responses.append(_decode(model, new_tokens))
+                responses.append(_decode(tokenizer, new_tokens))
 
             print(f"[HarmBench] Generated {min(i + batch_size, len(prompts))}/{len(prompts)}")
 
@@ -139,6 +146,7 @@ def score_harmbench_responses(
 
 def evaluate_harmbench_asr(
     model,
+    tokenizer,
     tokenize_fn,
     fwd_pre_hooks: list = [],
     fwd_hooks: list = [],
@@ -187,6 +195,7 @@ def evaluate_harmbench_asr(
     print(f"[HarmBench] Generating completions ({len(prompts)} prompts) …")
     responses = generate_responses_for_prompts(
         model=model,
+        tokenizer=tokenizer,
         tokenize_fn=tokenize_fn,
         prompts=prompts,
         fwd_pre_hooks=fwd_pre_hooks,
@@ -241,12 +250,14 @@ def evaluate_harmbench_asr(
     return result
 
 
-def _decode(model, token_ids: torch.Tensor) -> str:
-    """Best-effort decode using the model's tied tokenizer if available."""
-    # Try common attribute names
-    for attr in ("tokenizer", "_tokenizer"):
-        tok = getattr(model, attr, None)
-        if tok is not None:
-            return tok.decode(token_ids, skip_special_tokens=True)
-    # Fall back to the config's vocab — shouldn't normally happen
-    return str(token_ids.tolist())
+def _decode(tokenizer, token_ids: torch.Tensor) -> str:
+    """Decode a token-id tensor to text using the explicit tokenizer.
+
+    The tokenizer is required.  Earlier versions tried to read it off the
+    model object (``model.tokenizer`` / ``model._tokenizer``); plain HF
+    models have neither, so that silently fell through to the token-id
+    ``str(...)`` branch and corrupted downstream classifier scoring.
+    """
+    if tokenizer is None:
+        raise ValueError("tokenizer is required for response decoding")
+    return tokenizer.decode(token_ids, skip_special_tokens=True)

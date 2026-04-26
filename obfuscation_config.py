@@ -17,6 +17,13 @@ class ObfuscationConfig:
     # More = better generalization of rank-one patches.
     num_calibration_prompts: int = 32
 
+    # Number of prompts used for each empirical probe of the residual stream
+    # during iterative patching.  Each layer triggers up to 2 probes (one before
+    # attention sublayer patches, one between attn and MLP sublayers), so cost
+    # scales as ~2 * num_layers * num_probe_prompts forward passes.  Subset of
+    # the calibration prompts — smaller than calibration to keep cost bounded.
+    num_probe_prompts: int = 8
+
     # Whether to use separate random alias vectors for W_O and W_down at each layer.
     # True = more obfuscation (2 random vectors per layer), False = shared alias.
     separate_attn_mlp_aliases: bool = True
@@ -37,7 +44,7 @@ class ObfuscationConfig:
     #               Random dropout mask. Magnitude ≈ ||r̂||/√2. ε not used.
     # "scalar_projection"  = replace r̂ component with η · r̂ (single random scalar).
     #               Pollution purely along r̂.
-    # "full"      = replace entire writer output with a full random alias vector
+    # "full"      = replace the refusal component with a full random alias vector
     #               (original behaviour).  Highest pollution, worst utility.
     projection_mode: str = "hadamard"
 
@@ -46,3 +53,12 @@ class ObfuscationConfig:
     # layer, so a different direction is obfuscated at each layer.  The attacker
     # must then recover a different direction per layer rather than one global one.
     per_layer_direction: bool = False
+
+    # Use writer-output refusal directions for writer patches.
+    # When True, APRS estimates a separate harmful-minus-harmless direction at
+    # each attention output projection (W_O) and each MLP output projection
+    # (W_down), then patches each writer using its own local output-space
+    # direction.  If a local direction is degenerate, the code falls back to
+    # the residual-stream direction selected by ``per_layer_direction`` /
+    # global r̂.
+    writer_output_directions: bool = False

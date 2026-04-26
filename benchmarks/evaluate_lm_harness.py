@@ -26,7 +26,7 @@ import random
 import subprocess
 import sys
 import tempfile
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _ROOT not in sys.path:
@@ -133,7 +133,7 @@ def run_lm_harness(
     fwd_hooks: Optional[list] = None,
     tasks: Optional[list] = None,
     n_samples: int = 100,
-    batch_size: int = 4,
+    batch_size: Union[int, str] = 32,
     device: Optional[str] = None,
     output_dir: Optional[str] = None,
     seed: int = 42,

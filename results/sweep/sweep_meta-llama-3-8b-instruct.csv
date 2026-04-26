@@ -1,0 +1,9 @@
+model,epsilon,num_pertinent_layers,pertinent_layers,avg_cos_sim,max_cos_sim,pile_bpb_pre,alpaca_bpb_pre,pile_bpb,alpaca_bpb,gsm8k_pre,gsm8k
+meta-llama/Meta-Llama-3-8B-Instruct,0.01,2,"[11, 12]",0.6604,0.7497,0.7613,0.5459,0.7788,0.5462,,
+meta-llama/Meta-Llama-3-8B-Instruct,0.025,2,"[11, 12]",0.6588,0.7497,0.7613,0.5459,0.7831,0.5533,,
+meta-llama/Meta-Llama-3-8B-Instruct,0.05,2,"[11, 12]",0.6568,0.7497,0.7613,0.5459,0.7948,0.5779,,
+meta-llama/Meta-Llama-3-8B-Instruct,0.1,2,"[11, 12]",0.6575,0.7497,0.7613,0.5459,1.1417,1.8048,,
+meta-llama/Meta-Llama-3-8B-Instruct,0.15,2,"[11, 12]",0.6557,0.7497,0.7613,0.5459,3.6127,4.3124,,
+meta-llama/Meta-Llama-3-8B-Instruct,0.2,2,"[11, 12]",0.6477,0.7497,0.7613,0.5459,6.2988,6.4585,,
+meta-llama/Meta-Llama-3-8B-Instruct,0.3,2,"[11, 12]",0.6204,0.7497,0.7613,0.5459,9.8504,9.1760,,
+meta-llama/Meta-Llama-3-8B-Instruct,0.5,2,"[11, 12]",0.5638,0.7497,0.7613,0.5459,12.6412,11.5786,,

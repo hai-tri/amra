@@ -40,14 +40,26 @@ def collect_residual_activations(
     prompts: List[str],
     tokenize_fn,
     num_prompts: int = 32,
+    fwd_pre_hooks: Optional[List] = None,
+    fwd_hooks: Optional[List] = None,
 ) -> Dict[str, torch.Tensor]:
     """
     Run forward passes and collect residual-stream activations at every
     sublayer boundary (last-token position).
 
+    Optional ``fwd_pre_hooks`` / ``fwd_hooks`` apply the active defense's
+    inference-time hooks during collection — required when the defense is
+    hook-based (surgical, CAST, AlphaSteer) rather than weight-modifying,
+    otherwise this collects activations from the *undefended* model.
+
     Returns a dict mapping probe-point names to tensors of shape
     ``(num_prompts, d_model)``.
     """
+    from pipeline.utils.hook_utils import add_hooks as _add_hooks
+
+    fwd_pre_hooks = fwd_pre_hooks or []
+    fwd_hooks = fwd_hooks or []
+
     device = next(model.parameters()).device
     num_layers = components.num_layers
 
@@ -61,35 +73,37 @@ def collect_residual_activations(
             buffers.setdefault(key, []).append(vec)
         return hook_fn
 
-    hooks = []
-    for ell in range(num_layers):
-        hooks.append(
-            components.get_attn_layernorm(ell).register_forward_hook(
-                _make_hook(f"layer_{ell}_attn_ln")
-            )
-        )
-        hooks.append(
-            components.get_mlp_layernorm(ell).register_forward_hook(
-                _make_hook(f"layer_{ell}_mlp_ln")
-            )
-        )
-    hooks.append(
-        components.final_norm.register_forward_hook(
-            _make_hook("final_ln")
-        )
-    )
-
     prompts_to_use = prompts[:num_prompts]
-    with torch.no_grad():
-        for prompt in tqdm(prompts_to_use, desc="Collecting residual activations"):
-            inputs = tokenize_fn(instructions=[prompt])
-            model(
-                input_ids=inputs.input_ids.to(device),
-                attention_mask=inputs.attention_mask.to(device),
+    with _add_hooks(fwd_pre_hooks, fwd_hooks):
+        probe_hooks = []
+        try:
+            for ell in range(num_layers):
+                probe_hooks.append(
+                    components.get_attn_layernorm(ell).register_forward_hook(
+                        _make_hook(f"layer_{ell}_attn_ln")
+                    )
+                )
+                probe_hooks.append(
+                    components.get_mlp_layernorm(ell).register_forward_hook(
+                        _make_hook(f"layer_{ell}_mlp_ln")
+                    )
+                )
+            probe_hooks.append(
+                components.final_norm.register_forward_hook(
+                    _make_hook("final_ln")
+                )
             )
 
-    for h in hooks:
-        h.remove()
+            with torch.no_grad():
+                for prompt in tqdm(prompts_to_use, desc="Collecting residual activations"):
+                    inputs = tokenize_fn(instructions=[prompt])
+                    model(
+                        input_ids=inputs.input_ids.to(device),
+                        attention_mask=inputs.attention_mask.to(device),
+                    )
+        finally:
+            for h in probe_hooks:
+                h.remove()
 
     # Stack lists into (N, d) tensors
     result = {k: torch.stack(v) for k, v in buffers.items()}
@@ -105,17 +119,27 @@ def collect_output_logits(
     prompts: List[str],
     tokenize_fn,
     num_prompts: int = 32,
+    fwd_pre_hooks: Optional[List] = None,
+    fwd_hooks: Optional[List] = None,
 ) -> torch.Tensor:
     """
     Collect last-token logits for each prompt.
 
+    Optional ``fwd_pre_hooks`` / ``fwd_hooks`` apply the active defense's
+    inference-time hooks — required when the defense is hook-based.
+
     Returns tensor of shape ``(num_prompts, vocab_size)`` in float32 on CPU.
     """
+    from pipeline.utils.hook_utils import add_hooks as _add_hooks
+
+    fwd_pre_hooks = fwd_pre_hooks or []
+    fwd_hooks = fwd_hooks or []
+
     device = next(model.parameters()).device
     all_logits = []
 
     prompts_to_use = prompts[:num_prompts]
-    with torch.no_grad():
+    with torch.no_grad(), _add_hooks(fwd_pre_hooks, fwd_hooks):
         for prompt in tqdm(prompts_to_use, desc="Collecting output logits"):
             inputs = tokenize_fn(instructions=[prompt])
             outputs = model(
@@ -280,29 +304,40 @@ def evaluate_defense_integrity(
     num_prompts: int = 32,
     pertinent_layers: Optional[List[int]] = None,
     artifact_dir: Optional[str] = None,
+    fwd_pre_hooks: Optional[List] = None,
+    fwd_hooks: Optional[List] = None,
 ) -> Dict:
     """
     Collect post-defense measurements, compare with pre-defense, and return
     a full integrity report.
 
-    Call this AFTER ``apply_obfuscation``.
+    Call this AFTER the defense is applied.  For hook-based defenses
+    (surgical / CAST / AlphaSteer), pass the defense's
+    ``fwd_pre_hooks`` / ``fwd_hooks`` so the "post-defense" measurements
+    actually reflect the defense; otherwise they would measure the
+    undefended model.  For weight-modifying defenses (APRS, circuit
+    breakers) the hooks lists are empty and these parameters are no-ops.
     """
     # --- Post-defense residual-stream stats ---
     print("[integrity] Collecting post-defense residual-stream stats …")
     post_acts_harmful = collect_residual_activations(
         model, components, harmful_prompts, tokenize_fn, num_prompts,
+        fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=fwd_hooks,
     )
     post_acts_harmless = collect_residual_activations(
         model, components, harmless_prompts, tokenize_fn, num_prompts,
+        fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=fwd_hooks,
     )
 
     # --- Post-defense output logits ---
     print("[integrity] Collecting post-defense output logits …")
     post_logits_harmful = collect_output_logits(
         model, harmful_prompts, tokenize_fn, num_prompts,
+        fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=fwd_hooks,
     )
     post_logits_harmless = collect_output_logits(
         model, harmless_prompts, tokenize_fn, num_prompts,
+        fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=fwd_hooks,
     )
 
     # --- Residual stream comparison ---

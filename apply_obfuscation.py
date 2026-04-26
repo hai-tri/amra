@@ -7,17 +7,22 @@ Core defense implementation (Steps 0–6 from the technical specification).
 The algorithm:
   0. Extract the refusal direction and identify pertinent layers.
   1. Generate per-layer random alias vectors (zero-mean, ε-scaled).
-  2. Patch writer matrices (W_O, W_down) at pertinent layers so their output
-     at the calibration operating point becomes a random alias instead of the
-     original value.
-  3. Track cumulative pollution (net change to the residual stream).
+  2. Patch writer matrices (W_O, W_down) at pertinent layers so the refusal
+     component of each writer output at the calibration operating point becomes
+     a random alias.
+  3. Iterate layer-by-layer, probing the actual polluted residual stream in
+     the partially-patched model via short forward passes.  This handles
+     architectures (Gemma 2/3) whose post-attention / post-feedforward
+     LayerNorms nonlinearly transform the writer output before the residual
+     add — in such cases the net pollution cannot be accumulated analytically.
   4. Patch reader matrices (Q, K, V, gate, up) at every downstream layer so
-     they compensate for the LayerNorm-transformed pollution and produce the
-     same activations as the undefended model.
+     they compensate for the empirically-measured pollution and produce the
+     same outputs as the undefended model on calibration inputs.
   5. (Implicit — handled by Step 4 for attention output projections at
      non-pertinent layers.)
-  6. Patch the unembedding matrix (LM head) against cumulative pollution
-     through the final LayerNorm.
+  6. Probe the final residual stream and patch the unembedding matrix (LM head)
+     so that the model's logits on calibration inputs match the undefended
+     model.
 
 No training is required.  This is a one-time, post-hoc weight edit.
 """
@@ -31,7 +36,9 @@ from obfuscation_config import ObfuscationConfig
 from obfuscation_utils import (
     ModelComponents,
     collect_calibration_activations,
+    collect_writer_output_refusal_directions,
     generate_random_alias,
+    probe_residual_stream,
     rank_one_update,
 )
 
@@ -78,11 +85,18 @@ def select_pertinent_layers(
     n_layers = mean_diffs.shape[1]
 
     if ablation_scores is not None:
-        # Use causal ablation scores — the ground truth for which layers matter
-        # Aggregate across token positions: take the minimum score per layer
-        # (most causally impactful position at that layer)
+        # Use causal ablation scores at the selected token position.  Older
+        # artifacts may not include position metadata; in that case keep the
+        # previous cross-position behavior as a compatibility fallback.
+        scored_entries = [
+            entry for entry in ablation_scores
+            if entry.get("position") == pos
+        ]
+        if not scored_entries:
+            scored_entries = ablation_scores
+
         per_layer_best = {}
-        for entry in ablation_scores:
+        for entry in scored_entries:
             ell = entry["layer"]
             score = entry["refusal_score"]
             if ell not in per_layer_best or score < per_layer_best[ell]:
@@ -181,23 +195,61 @@ def apply_obfuscation(
     # Normalised refusal direction(s)
     r_hat_global = (direction / direction.norm()).float().to(device)
 
-    # Per-layer direction dict: maps layer_idx → unit vector
+    # Residual-stream direction dict: maps layer_idx -> unit vector.
+    # This is either the global selected direction or the per-layer block-input
+    # direction from generate_directions.
     if cfg.per_layer_direction:
-        r_hat_map: Dict[int, torch.Tensor] = {}
+        r_hat_residual_map: Dict[int, torch.Tensor] = {}
         for ell in sorted(pertinent_layers):
             layer_dir = mean_diffs[selected_pos, ell].float().to(device)
             norm = layer_dir.norm()
             if norm > 1e-8:
-                r_hat_map[ell] = layer_dir / norm
+                r_hat_residual_map[ell] = layer_dir / norm
             else:
                 # Fallback to global if layer direction is degenerate
-                r_hat_map[ell] = r_hat_global
+                r_hat_residual_map[ell] = r_hat_global
         print(f"[obfuscation] Using per-layer refusal directions")
     else:
-        r_hat_map = {ell: r_hat_global for ell in sorted(pertinent_layers)}
+        r_hat_residual_map = {ell: r_hat_global for ell in sorted(pertinent_layers)}
 
-    # Keep a global r_hat reference for compatibility
-    r_hat = r_hat_global
+    def _unit_or_fallback(vec: torch.Tensor, fallback: torch.Tensor) -> torch.Tensor:
+        vec = vec.float().to(device)
+        norm = vec.norm()
+        if norm > 1e-8:
+            return vec / norm
+        return fallback
+
+    if cfg.writer_output_directions:
+        if harmless_prompts is None:
+            print("[obfuscation] writer_output_directions requested but no "
+                  "harmless prompts were provided; falling back to residual "
+                  "directions.")
+            r_hat_attn_map = dict(r_hat_residual_map)
+            r_hat_mlp_map = dict(r_hat_residual_map)
+        else:
+            print("[obfuscation] Extracting writer-output refusal directions")
+            writer_dirs = collect_writer_output_refusal_directions(
+                model=model,
+                components=components,
+                harmful_prompts=harmful_prompts,
+                harmless_prompts=harmless_prompts,
+                tokenize_fn=tokenize_fn,
+                num_prompts=cfg.num_calibration_prompts,
+            )
+            r_hat_attn_map = {}
+            r_hat_mlp_map = {}
+            for ell in sorted(pertinent_layers):
+                fallback = r_hat_residual_map[ell]
+                r_hat_attn_map[ell] = _unit_or_fallback(
+                    writer_dirs["attn"][ell], fallback
+                )
+                r_hat_mlp_map[ell] = _unit_or_fallback(
+                    writer_dirs["mlp"][ell], fallback
+                )
+            print("[obfuscation] Using per-writer output refusal directions")
+    else:
+        r_hat_attn_map = dict(r_hat_residual_map)
+        r_hat_mlp_map = dict(r_hat_residual_map)
 
     mode = cfg.projection_mode
     assert mode in ("hadamard", "binary", "mask", "scalar_projection", "full"), \
@@ -218,28 +270,31 @@ def apply_obfuscation(
     if mode == "hadamard":
         # Hadamard mode: r̂ℓ ⊙ ξ where ξ ~ N(0, ε²I).
         for ell in sorted(pertinent_layers):
-            r_l = r_hat_map[ell]
-            attn_noise[ell] = r_l * torch.randn(d, device=device, generator=generator) * cfg.epsilon
+            r_attn = r_hat_attn_map[ell]
+            r_mlp = r_hat_mlp_map[ell]
+            attn_noise[ell] = r_attn * torch.randn(d, device=device, generator=generator) * cfg.epsilon
             if cfg.separate_attn_mlp_aliases:
-                mlp_noise[ell] = r_l * torch.randn(d, device=device, generator=generator) * cfg.epsilon
+                mlp_noise[ell] = r_mlp * torch.randn(d, device=device, generator=generator) * cfg.epsilon
             else:
                 mlp_noise[ell] = attn_noise[ell].clone()
     elif mode == "binary":
         # Binary mode: r̂ℓ ⊙ s where s_i ∈ {-1, +1} (Rademacher).
         for ell in sorted(pertinent_layers):
-            r_l = r_hat_map[ell]
-            attn_noise[ell] = r_l * _rademacher(d)
+            r_attn = r_hat_attn_map[ell]
+            r_mlp = r_hat_mlp_map[ell]
+            attn_noise[ell] = r_attn * _rademacher(d)
             if cfg.separate_attn_mlp_aliases:
-                mlp_noise[ell] = r_l * _rademacher(d)
+                mlp_noise[ell] = r_mlp * _rademacher(d)
             else:
                 mlp_noise[ell] = attn_noise[ell].clone()
     elif mode == "mask":
         # Mask mode: r̂ℓ ⊙ m where m_i ∈ {0, 1}.
         for ell in sorted(pertinent_layers):
-            r_l = r_hat_map[ell]
-            attn_noise[ell] = r_l * _binary_mask(d)
+            r_attn = r_hat_attn_map[ell]
+            r_mlp = r_hat_mlp_map[ell]
+            attn_noise[ell] = r_attn * _binary_mask(d)
             if cfg.separate_attn_mlp_aliases:
-                mlp_noise[ell] = r_l * _binary_mask(d)
+                mlp_noise[ell] = r_mlp * _binary_mask(d)
             else:
                 mlp_noise[ell] = attn_noise[ell].clone()
     elif mode == "scalar_projection":
@@ -252,7 +307,8 @@ def apply_obfuscation(
             else:
                 mlp_noise[ell] = eta
     else:  # full
-        # Full-alias mode: complete d-dimensional random vector.
+        # Full-alias mode: complete d-dimensional random vector used as the
+        # replacement for the local refusal component.
         for ell in sorted(pertinent_layers):
             attn_noise[ell] = generate_random_alias(d, cfg.epsilon, device, generator)
             if cfg.separate_attn_mlp_aliases:
@@ -261,11 +317,84 @@ def apply_obfuscation(
                 mlp_noise[ell] = attn_noise[ell].clone()
 
     # ----------------------------------------------------------------
-    # Steps 2–5: Patch writers and readers, tracking pollution
+    # Steps 2–5: Patch writers and readers with *empirical* pollution tracking.
+    #
+    # For each layer ell, we probe the actual (polluted) residual stream via a
+    # forward pass through the currently-patched model.  This is what makes the
+    # defense correct on architectures where the writer's output passes through
+    # one or more LayerNorms inside the residual branch before being added to
+    # the stream (Gemma 2/3).  Under those wrappings, the net pollution is a
+    # nonlinear function of the alias vector — analytical accumulation would
+    # drift from reality.
+    #
+    # Within a layer, attention readers read the residual before the attention
+    # writer fires, and MLP readers read after it fires, so we probe twice per
+    # layer.  Reader patches at the calibration point do not themselves change
+    # the residual stream (by construction they match clean outputs), so
+    # probing *before* the current layer's patches and *after* attention writer
+    # injection is sufficient.
     # ----------------------------------------------------------------
-    cumulative_pollution = torch.zeros(d, device=device, dtype=torch.float32)
+
+    # Build the probe prompt list (subset of the calibration mix).
+    if harmless_prompts is not None and harmless_ratio > 0:
+        n_harmless = int(cfg.num_calibration_prompts * harmless_ratio)
+        n_harmful = cfg.num_calibration_prompts - n_harmless
+        probe_pool = (
+            list(harmful_prompts[:n_harmful]) +
+            list(harmless_prompts[:n_harmless])
+        )
+    else:
+        probe_pool = list(harmful_prompts[:cfg.num_calibration_prompts])
+    probe_prompts = probe_pool[:max(1, cfg.num_probe_prompts)]
+
     num_writers_patched = 0
     num_readers_patched = 0
+    pollution_injected = False
+    pollution_threshold = 1e-6
+
+    def _patch_readers_at(ell: int, sublayer: str) -> int:
+        """Empirically probe and patch the readers at (ell, sublayer).
+
+        sublayer is "attn" or "mlp".  Returns the number of readers patched.
+        """
+        if writer_only or not pollution_injected:
+            return 0
+        key = f"layer_{ell}_{sublayer}_ln_input"
+        probed = probe_residual_stream(
+            model=model,
+            components=components,
+            keys=[key],
+            prompts=probe_prompts,
+            tokenize_fn=tokenize_fn,
+        )
+        x_clean = activations[key].float()
+        x_polluted = probed[key].float()
+
+        if (x_polluted - x_clean).norm().item() <= pollution_threshold:
+            return 0
+
+        ln_module = (components.get_attn_layernorm(ell)
+                     if sublayer == "attn"
+                     else components.get_mlp_layernorm(ell))
+        readers = (components.get_attn_reader_projs(ell)
+                   if sublayer == "attn"
+                   else components.get_mlp_reader_projs(ell))
+
+        with torch.no_grad():
+            ln_clean = ln_module(
+                x_clean.unsqueeze(0).unsqueeze(0)
+            ).squeeze().float()
+            ln_polluted = ln_module(
+                x_polluted.unsqueeze(0).unsqueeze(0)
+            ).squeeze().float()
+
+        patched = 0
+        for _, proj_module in readers:
+            W = proj_module.weight.data
+            W_new = rank_one_update(W, ln_polluted, W.float() @ ln_clean)
+            proj_module.weight.data = W_new
+            patched += 1
+        return patched
 
     for ell in range(num_layers):
 
@@ -273,34 +402,18 @@ def apply_obfuscation(
         # ATTENTION SUBLAYER
         # ==============================================================
 
-        # --- Step 4a: Patch attention readers (Q, K, V) if pollution exists ---
-        if cumulative_pollution.norm() > 1e-8 and not writer_only:
-            ln_module = components.get_attn_layernorm(ell)
-            x_clean = activations[f"layer_{ell}_attn_ln_input"].float()
-            x_polluted = x_clean + cumulative_pollution
-
-            # Empirical LayerNorm correction: compute LN on both clean and
-            # polluted residual streams, then patch readers so that
-            # W_read @ LN(x_polluted) == W_read @ LN(x_clean).
-            with torch.no_grad():
-                ln_clean = ln_module(
-                    x_clean.unsqueeze(0).unsqueeze(0)
-                ).squeeze().float()
-                ln_polluted = ln_module(
-                    x_polluted.unsqueeze(0).unsqueeze(0)
-                ).squeeze().float()
-
-            for proj_name, proj_module in components.get_attn_reader_projs(ell):
-                W = proj_module.weight.data
-                W_new = rank_one_update(W, ln_polluted, W.float() @ ln_clean)
-                proj_module.weight.data = W_new
-                num_readers_patched += 1
+        # --- Step 4a: Patch attention readers (Q, K, V) ---
+        num_readers_patched += _patch_readers_at(ell, "attn")
 
         # --- Step 2a: Patch W_O (attention writer) if pertinent ---
+        # At this point, attention readers at ell are already patched, so the
+        # actual pre-W_O activation at inference on calibration prompts equals
+        # the clean calibration value.  We can therefore anchor the rank-one
+        # writer patch at the clean x_attn without drift.
         if ell in pertinent_layers and cfg.patch_writers in ("both", "attn_only"):
             o_proj = components.get_attn_output_proj(ell)
             x_attn = activations[f"layer_{ell}_attn_o_input"].float()
-            r_l = r_hat_map[ell]
+            r_l = r_hat_attn_map[ell]
 
             current_output = o_proj.weight.data.float() @ x_attn
 
@@ -311,43 +424,25 @@ def apply_obfuscation(
                 proj_scalar = (current_output @ r_l).item()
                 target = current_output - proj_scalar * r_l + attn_noise[ell] * r_l
             else:
-                target = attn_noise[ell].float()
+                proj_scalar = (current_output @ r_l).item()
+                target = current_output - proj_scalar * r_l + attn_noise[ell].float()
 
             o_proj.weight.data = rank_one_update(o_proj.weight.data, x_attn, target)
-
-            # Track net change to the residual stream
-            cumulative_pollution = cumulative_pollution + (target - current_output)
             num_writers_patched += 1
+            pollution_injected = True
 
         # ==============================================================
         # MLP SUBLAYER
         # ==============================================================
 
-        # --- Step 4b: Patch MLP readers (gate, up) if pollution exists ---
-        if cumulative_pollution.norm() > 1e-8 and not writer_only:
-            ln_module = components.get_mlp_layernorm(ell)
-            x_clean = activations[f"layer_{ell}_mlp_ln_input"].float()
-            x_polluted = x_clean + cumulative_pollution
-
-            with torch.no_grad():
-                ln_clean = ln_module(
-                    x_clean.unsqueeze(0).unsqueeze(0)
-                ).squeeze().float()
-                ln_polluted = ln_module(
-                    x_polluted.unsqueeze(0).unsqueeze(0)
-                ).squeeze().float()
-
-            for proj_name, proj_module in components.get_mlp_reader_projs(ell):
-                W = proj_module.weight.data
-                W_new = rank_one_update(W, ln_polluted, W.float() @ ln_clean)
-                proj_module.weight.data = W_new
-                num_readers_patched += 1
+        # --- Step 4b: Patch MLP readers (gate, up) ---
+        num_readers_patched += _patch_readers_at(ell, "mlp")
 
         # --- Step 2b: Patch W_down (MLP writer) if pertinent ---
         if ell in pertinent_layers and cfg.patch_writers in ("both", "mlp_only"):
             down_proj = components.get_mlp_output_proj(ell)
             x_mlp = activations[f"layer_{ell}_mlp_down_input"].float()
-            r_l = r_hat_map[ell]
+            r_l = r_hat_mlp_map[ell]
 
             current_output = down_proj.weight.data.float() @ x_mlp
 
@@ -358,41 +453,54 @@ def apply_obfuscation(
                 proj_scalar = (current_output @ r_l).item()
                 target = current_output - proj_scalar * r_l + mlp_noise[ell] * r_l
             else:
-                target = mlp_noise[ell].float()
+                proj_scalar = (current_output @ r_l).item()
+                target = current_output - proj_scalar * r_l + mlp_noise[ell].float()
 
             down_proj.weight.data = rank_one_update(
                 down_proj.weight.data, x_mlp, target
             )
-
-            cumulative_pollution = cumulative_pollution + (target - current_output)
             num_writers_patched += 1
+            pollution_injected = True
 
     # ----------------------------------------------------------------
     # Step 6: Patch the unembedding matrix (LM head)
+    #
+    # Probe the final residual stream empirically — same rationale as
+    # per-layer probing: the net pollution reaching the final LN is the
+    # architecturally-transformed sum of writer contributions, not the naive
+    # analytical sum.
     # ----------------------------------------------------------------
-    if cumulative_pollution.norm() > 1e-8:
-        z_sum = cumulative_pollution
-        final_ln = components.final_norm
+    z_sum_norm = 0.0
+    if pollution_injected:
+        probed_final = probe_residual_stream(
+            model=model,
+            components=components,
+            keys=["final_ln_input"],
+            prompts=probe_prompts,
+            tokenize_fn=tokenize_fn,
+        )
         x_clean_final = activations["final_ln_input"].float()
-        x_polluted_final = x_clean_final + z_sum
+        x_polluted_final = probed_final["final_ln_input"].float()
+        z_sum_norm = (x_polluted_final - x_clean_final).norm().item()
 
-        with torch.no_grad():
-            ln_clean = final_ln(
-                x_clean_final.unsqueeze(0).unsqueeze(0)
-            ).squeeze().float()
-            ln_polluted = final_ln(
-                x_polluted_final.unsqueeze(0).unsqueeze(0)
-            ).squeeze().float()
+        if z_sum_norm > pollution_threshold:
+            final_ln = components.final_norm
+            with torch.no_grad():
+                ln_clean = final_ln(
+                    x_clean_final.unsqueeze(0).unsqueeze(0)
+                ).squeeze().float()
+                ln_polluted = final_ln(
+                    x_polluted_final.unsqueeze(0).unsqueeze(0)
+                ).squeeze().float()
 
-        W_unembed = components.lm_head.weight.data
-        target_logits = W_unembed.float() @ ln_clean
-        W_unembed_new = rank_one_update(W_unembed, ln_polluted, target_logits)
-        components.lm_head.weight.data = W_unembed_new
+            W_unembed = components.lm_head.weight.data
+            target_logits = W_unembed.float() @ ln_clean
+            W_unembed_new = rank_one_update(W_unembed, ln_polluted, target_logits)
+            components.lm_head.weight.data = W_unembed_new
 
     # ----------------------------------------------------------------
     # Diagnostics
     # ----------------------------------------------------------------
-    z_sum_norm = cumulative_pollution.norm().item()
     print(f"[obfuscation] Defense applied ({mode} mode).")
     print(f"  Writers patched : {num_writers_patched}")
     print(f"  Readers patched : {num_readers_patched}")

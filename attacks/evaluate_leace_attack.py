@@ -19,7 +19,7 @@ hook-based evaluation infrastructure.
 import torch
 import sys
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 _REFUSAL_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "refusal_direction")
 if _REFUSAL_DIR not in sys.path:
@@ -27,6 +27,7 @@ if _REFUSAL_DIR not in sys.path:
 
 from pipeline.submodules.generate_directions import get_mean_activations
 from pipeline.submodules.select_direction import get_refusal_scores
+from pipeline.utils.hook_utils import add_hooks
 
 
 # ======================================================================
@@ -165,6 +166,8 @@ def _collect_last_token_activations(
     block_modules,
     prompts: List[str],
     batch_size: int = 128,
+    base_fwd_pre_hooks: Optional[List] = None,
+    base_fwd_hooks: Optional[List] = None,
 ) -> torch.Tensor:
     """
     Collect last-token activations at every layer.
@@ -173,6 +176,9 @@ def _collect_last_token_activations(
     -------
     Tensor of shape (n_prompts, n_layers, d_model)
     """
+    base_fwd_pre_hooks = base_fwd_pre_hooks or []
+    base_fwd_hooks = base_fwd_hooks or []
+
     num_layers = model.config.num_hidden_layers
     d_model = model.config.hidden_size
     device = next(model.parameters()).device
@@ -184,27 +190,29 @@ def _collect_last_token_activations(
         batch = prompts[i : i + batch_size]
         batch_acts = torch.zeros(len(batch), num_layers, d_model, dtype=torch.float32)
 
-        hooks = []
-        for ell in range(num_layers):
-            def make_hook(layer_idx):
-                def hook_fn(module, inp):
-                    x = inp[0] if isinstance(inp, tuple) else inp
-                    # Last token position
-                    batch_acts[:x.shape[0], layer_idx] = x[:, -1, :].detach().float().cpu()
-                return hook_fn
-            hooks.append(
-                block_modules[ell].register_forward_pre_hook(make_hook(ell))
-            )
+        with add_hooks(base_fwd_pre_hooks, base_fwd_hooks):
+            hooks = []
+            try:
+                for ell in range(num_layers):
+                    def make_hook(layer_idx):
+                        def hook_fn(module, inp):
+                            x = inp[0] if isinstance(inp, tuple) else inp
+                            # Last token position
+                            batch_acts[:x.shape[0], layer_idx] = x[:, -1, :].detach().float().cpu()
+                        return hook_fn
+                    hooks.append(
+                        block_modules[ell].register_forward_pre_hook(make_hook(ell))
+                    )
 
-        with torch.no_grad():
-            inputs = tokenize_fn(instructions=batch)
-            model(
-                input_ids=inputs.input_ids.to(device),
-                attention_mask=inputs.attention_mask.to(device),
-            )
-
-        for h in hooks:
-            h.remove()
+                with torch.no_grad():
+                    inputs = tokenize_fn(instructions=batch)
+                    model(
+                        input_ids=inputs.input_ids.to(device),
+                        attention_mask=inputs.attention_mask.to(device),
+                    )
+            finally:
+                for h in hooks:
+                    h.remove()
 
         all_activations.append(batch_acts)
 
@@ -228,6 +236,8 @@ def leace_attack(
     refusal_toks,
     batch_size: int = 128,
     svd_tol: float = 0.01,
+    base_fwd_pre_hooks: Optional[List] = None,
+    base_fwd_hooks: Optional[List] = None,
 ) -> Dict:
     """
     LEACE concept-erasure attack (Marks et al. 2023).
@@ -246,6 +256,9 @@ def leace_attack(
         * ``max_cos_sim`` — max |cos_sim| across layers
         * ``singular_values`` — per-layer singular values from LEACE
     """
+    base_fwd_pre_hooks = base_fwd_pre_hooks or []
+    base_fwd_hooks = base_fwd_hooks or []
+
     num_layers = model.config.num_hidden_layers
     d_model = model.config.hidden_size
     device = next(model.parameters()).device
@@ -253,10 +266,14 @@ def leace_attack(
     print("[LEACE] Collecting activations from harmful prompts …")
     harmful_acts = _collect_last_token_activations(
         model, tokenize_fn, block_modules, harmful_prompts, batch_size,
+        base_fwd_pre_hooks=base_fwd_pre_hooks,
+        base_fwd_hooks=base_fwd_hooks,
     )
     print("[LEACE] Collecting activations from harmless prompts …")
     benign_acts = _collect_last_token_activations(
         model, tokenize_fn, block_modules, benign_prompts, batch_size,
+        base_fwd_pre_hooks=base_fwd_pre_hooks,
+        base_fwd_hooks=base_fwd_hooks,
     )
 
     n_harmful = harmful_acts.shape[0]
@@ -357,16 +374,16 @@ def leace_attack(
             return activation
         return hook_fn
 
-    fwd_pre_hooks = [
+    attack_fwd_pre_hooks = [
         (block_modules[ell],
          make_leace_pre_hook(
              leace_results[ell]["proj_left"],
              leace_results[ell]["proj_right"],
              leace_results[ell]["bias"],
-         ))
+        ))
         for ell in range(num_layers)
     ]
-    fwd_hooks = [
+    attack_fwd_hooks = [
         (attn_modules[ell],
          make_leace_output_hook(
              leace_results[ell]["proj_left"],
@@ -388,7 +405,8 @@ def leace_attack(
     print("[LEACE] Measuring post-attack refusal score …")
     post_scores = get_refusal_scores(
         model, harmful_prompts, tokenize_fn, refusal_toks,
-        fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=fwd_hooks,
+        fwd_pre_hooks=list(base_fwd_pre_hooks) + attack_fwd_pre_hooks,
+        fwd_hooks=list(base_fwd_hooks) + attack_fwd_hooks,
         batch_size=batch_size,
     )
     mean_score = post_scores.mean().item()

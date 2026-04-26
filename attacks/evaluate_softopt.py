@@ -36,6 +36,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from pipeline.submodules.evaluate_jailbreak import substring_matching_judge_fn
+from pipeline.utils.hook_utils import add_hooks
 from device_utils import (
     empty_cache as _dev_empty_cache,
     get_device_str as _dev_get_device_str,
@@ -168,6 +169,8 @@ def run_softopt_evaluation(
     softopt_config: Optional[SoftOptConfig] = None,
     max_new_tokens: int = 512,
     limit: Optional[int] = None,
+    fwd_pre_hooks: Optional[List] = None,
+    fwd_hooks: Optional[List] = None,
 ) -> Dict:
     """
     Run SoftOpt attack on the given model, judge with substring matching.
@@ -180,12 +183,17 @@ def run_softopt_evaluation(
         softopt_config: Attack hyperparameters.
         max_new_tokens: Max generation length.
         limit: Max number of behaviors to test.
+        fwd_pre_hooks/fwd_hooks: Optional defense hooks.  These must be passed
+            for hook-based defenses so SoftOpt attacks the defended model, not
+            the bare model weights.
 
     Returns:
         Dict with ASR score and per-instance results.
     """
     if softopt_config is None:
         softopt_config = SoftOptConfig()
+    fwd_pre_hooks = fwd_pre_hooks or []
+    fwd_hooks = fwd_hooks or []
 
     device = softopt_config.device
 
@@ -202,19 +210,23 @@ def run_softopt_evaluation(
         behavior = item["behavior"]
         target = item.get("default_target", "Sure, here's") + ":\n\n"
 
-        # Run optimization
-        opt_result = run_softopt(model, tokenizer, behavior, target, softopt_config)
-
-        # Generate from optimized embeddings
-        input_embeds = opt_result["input_embeds"].to(device)
-        with torch.no_grad():
-            output = model.generate(
-                inputs_embeds=input_embeds,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id,
+        # Run optimization and generation under the active defense hooks when
+        # the defense is hook-based (surgical / CAST / AlphaSteer).
+        with add_hooks(fwd_pre_hooks, fwd_hooks):
+            opt_result = run_softopt(
+                model, tokenizer, behavior, target, softopt_config
             )
-        generation = tokenizer.decode(output[0], skip_special_tokens=True)
+
+            # Generate from optimized embeddings
+            input_embeds = opt_result["input_embeds"].to(device)
+            with torch.no_grad():
+                output = model.generate(
+                    inputs_embeds=input_embeds,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=False,
+                    pad_token_id=tokenizer.eos_token_id,
+                )
+            generation = tokenizer.decode(output[0], skip_special_tokens=True)
 
         results.append({
             "behavior": behavior,

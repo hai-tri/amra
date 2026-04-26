@@ -43,7 +43,11 @@ from pipeline.utils.hook_utils import (
 )
 
 from obfuscation_config import ObfuscationConfig
-from obfuscation_utils import ModelComponents
+from obfuscation_utils import (
+    ModelComponents,
+    collect_writer_output_refusal_directions,
+    writer_output_direction_cosine_summary,
+)
 from device_utils import empty_cache as _dev_empty_cache
 from apply_obfuscation import apply_obfuscation
 from defenses.apply_surgical import apply_surgical
@@ -120,6 +124,10 @@ def parse_arguments():
                         help="Projection mode: hadamard (default), binary, mask, scalar_projection, or full")
     parser.add_argument("--per_layer_direction", action="store_true",
                         help="Use per-layer refusal directions instead of global r̂")
+    parser.add_argument("--writer_output_directions", action="store_true",
+                        help=("Use per-writer output refusal directions: "
+                              "W_O^l gets its own attention-output direction "
+                              "and W_down^l gets its own MLP-output direction"))
     parser.add_argument("--obfuscation_writer_only", action="store_true",
                         help="Skip reader (Q/K/V/gate/up) patches; apply writer (o_proj/down_proj) edits only. Ablation.")
 
@@ -153,10 +161,29 @@ def parse_arguments():
                         help="Skip XSTest over-refusal evaluation (Stage 4c)")
     parser.add_argument("--skip_lm_harness", action="store_true",
                         help="Skip GSM8k/MATH500/MMLU evaluation (Stage 9)")
+    parser.add_argument("--ce_loss_batch_size", type=int, default=4,
+                        help="Batch size for Pile/Alpaca CE-loss evaluation (default: 4)")
+    parser.add_argument("--ce_loss_n_batches", type=int, default=64,
+                        help=("Number of Pile/Alpaca CE-loss batches "
+                              "(default: 64, i.e. 256 sequences at batch size 4)"))
     parser.add_argument("--lm_harness_tasks", type=str, default="gsm8k,math500,mmlu",
                         help="Comma-separated lm-harness tasks to run (default: gsm8k,math500,mmlu)")
     parser.add_argument("--lm_harness_n", type=int, default=100,
                         help="Number of examples to sample per task (default: 100)")
+    parser.add_argument("--skip_alpacaeval", action="store_true",
+                        help="Skip AlpacaEval generation-quality evaluation (Stage 9b)")
+    parser.add_argument("--alpacaeval_n", type=int, default=100,
+                        help="Number of AlpacaEval prompts to sample (default: 100, max 805). "
+                             "Use 805 for the full benchmark.")
+    parser.add_argument("--alpacaeval_max_new_tokens", type=int, default=512,
+                        help="Max new tokens per AlpacaEval response (default: 512)")
+    parser.add_argument("--alpacaeval_skip_judge", action="store_true",
+                        help="Generate AlpacaEval completions but skip the "
+                             "LLM-judge win-rate step (saves completions only)")
+    parser.add_argument("--alpacaeval_annotator", type=str,
+                        default="alpaca_eval_gpt4_turbo_fn",
+                        help="alpaca_eval annotator config "
+                             "(default: alpaca_eval_gpt4_turbo_fn; requires OPENAI_API_KEY)")
     parser.add_argument("--harmbench_csv", type=str,
                         default=os.path.join(os.path.dirname(__file__), "data", "harmbench_behaviors_text_test.csv"),
                         help="Path to HarmBench behaviors CSV")
@@ -215,6 +242,9 @@ def parse_arguments():
                         help="Number of rewriting strategies to chain (default: 2)")
     parser.add_argument("--renellm_attempts", type=int, default=3,
                         help="Scenario attempts per behavior (default: 3)")
+    parser.add_argument("--artifact_subdir", type=str, default="obfuscation",
+                        help=("Subdirectory under the model run artifact dir "
+                              "for defense/eval artifacts (default: obfuscation)"))
     parser.add_argument("--save_csv", type=str, default=None,
                         help="Path to CSV file to append results to (e.g. results.csv)")
     return parser.parse_args()
@@ -227,6 +257,7 @@ def _generate_harmbench_for_attack(
     *,
     label: str,
     model,
+    tokenizer,
     tokenize_fn,
     behaviors,
     attacked_prompts=None,
@@ -250,6 +281,7 @@ def _generate_harmbench_for_attack(
             raise ValueError(f"{label}: expected attacked prompts or responses")
         responses = generate_responses_for_prompts(
             model=model,
+            tokenizer=tokenizer,
             tokenize_fn=tokenize_fn,
             prompts=attacked_prompts,
             fwd_pre_hooks=fwd_pre_hooks or [],
@@ -362,18 +394,21 @@ def run_pipeline(args):
         patch_writers=args.patch_writers,
         projection_mode=args.projection_mode,
         per_layer_direction=args.per_layer_direction,
+        writer_output_directions=args.writer_output_directions,
     )
 
     # Match Heretic's dataset sizes: 400 for direction extraction, 100 for val
     cfg.n_train = 400
     cfg.n_val = 100
 
-    # Reduce loss eval batches — 2048 is excessive for a quick utility check
-    cfg.ce_loss_batch_size = 4
-    cfg.ce_loss_n_batches = 64   # 64 batches × 4 = 256 sequences
+    cfg.ce_loss_batch_size = args.ce_loss_batch_size
+    cfg.ce_loss_n_batches = args.ce_loss_n_batches
 
     artifact_dir = cfg.artifact_path()
-    obf_artifact_dir = os.path.join(artifact_dir, "obfuscation")
+    artifact_subdir = args.artifact_subdir
+    if args.undefended_only and artifact_subdir == "obfuscation":
+        artifact_subdir = "undefended"
+    obf_artifact_dir = os.path.join(artifact_dir, artifact_subdir)
     os.makedirs(obf_artifact_dir, exist_ok=True)
 
     # Save obfuscation config
@@ -389,11 +424,15 @@ def run_pipeline(args):
 
     model_base = construct_model_base(cfg.model_path)
 
-    # Inject system prompt into the tokenizer
-    model_base.tokenize_instructions_fn = functools.partial(
-        model_base.tokenize_instructions_fn, system=SYSTEM_PROMPT,
-    )
-    print(f"[config] System prompt: \"{SYSTEM_PROMPT}\"")
+    # Inject system prompt into the tokenizer (Gemma models don't support system prompts)
+    _is_gemma = "gemma" in cfg.model_path.lower()
+    if not _is_gemma:
+        model_base.tokenize_instructions_fn = functools.partial(
+            model_base.tokenize_instructions_fn, system=SYSTEM_PROMPT,
+        )
+        print(f"[config] System prompt: \"{SYSTEM_PROMPT}\"")
+    else:
+        print("[config] System prompt: (none — Gemma does not support system prompts)")
 
     # On TPU/XLA, patch model.generate so every call uses bucket-padded inputs
     # and a static KV cache — amortizes graph compilation across attack/eval
@@ -495,6 +534,19 @@ def run_pipeline(args):
     undefended_refusal_mean = undefended_refusal_scores.mean().item()
     print(f"[pre-defense] Undefended refusal score: {undefended_refusal_mean:.4f}")
 
+    writer_output_dirs_pre = None
+    if args.defense_type == "obfuscation" and not args.undefended_only:
+        print("[pre-defense] Collecting writer-output refusal directions …")
+        writer_output_dirs_pre = collect_writer_output_refusal_directions(
+            model=model_base.model,
+            components=components,
+            harmful_prompts=harmful_val,
+            harmless_prompts=harmless_val,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            num_prompts=min(obf_cfg.num_calibration_prompts,
+                            len(harmful_val), len(harmless_val)),
+        )
+
     # Run attacks on the undefended model as baselines
     print("[pre-defense] Running attacks on undefended model …")
     undefended_abl = evaluate_abliteration_resistance(
@@ -552,12 +604,11 @@ def run_pipeline(args):
         print("--undefended_only: Running black-box attacks on undefended model …")
         print("=" * 60)
 
-        _undef_artifact_dir = os.path.join(
-            cfg.artifact_path(), "undefended"
-        )
+        _undef_artifact_dir = obf_artifact_dir
         os.makedirs(_undef_artifact_dir, exist_ok=True)
 
-        _undef_gcg = _undef_autodan = _undef_cipher = _undef_pair = _undef_renellm = None
+        _undef_gcg = _undef_autodan = _undef_cipher = None
+        _undef_pair = _undef_renellm = _undef_softopt = None
 
         if args.gcg:
             from attacks.evaluate_gcg import evaluate_gcg
@@ -634,14 +685,36 @@ def run_pipeline(args):
                 artifact_dir=_undef_artifact_dir,
             )
 
+        if args.softopt:
+            from attacks.evaluate_softopt import run_softopt_evaluation, SoftOptConfig
+            print("Stage U-6: SoftOpt on undefended model …")
+            device = next(model_base.model.parameters()).device
+            softopt_cfg = SoftOptConfig(
+                num_steps=args.softopt_steps,
+                seed=args.seed,
+                device=str(device),
+            )
+            _undef_softopt = run_softopt_evaluation(
+                model=model_base.model,
+                tokenizer=model_base.tokenizer,
+                benchmark_path=args.softopt_benchmark,
+                output_dir=_undef_artifact_dir,
+                softopt_config=softopt_cfg,
+                limit=args.softopt_limit,
+            )
+
         # Write CSV row for the undefended baseline — use the same 42-column
         # schema as defended runs so all_results.csv merges cleanly.
         if args.save_csv:
             import csv as _csv
             _fieldnames = [
-                "model", "defense_type", "projection_mode", "num_layers", "per_layer_direction",
+                "model", "defense_type", "projection_mode", "num_layers",
+                "per_layer_direction", "writer_output_directions", "writer_only",
                 "epsilon", "calibration_prompts", "pertinent_layers", "z_sum_norm",
                 "max_cos_sim", "avg_cos_sim",
+                "writer_attn_avg_cos_sim", "writer_mlp_avg_cos_sim",
+                "writer_output_avg_cos_sim", "writer_attn_max_cos_sim",
+                "writer_mlp_max_cos_sim", "writer_output_max_cos_sim",
                 "pca8_score_undefended", "pca8_score_defended",
                 "perlayer_score_undefended", "perlayer_score_defended",
                 "arditi_score_undefended", "arditi_score_defended",
@@ -655,10 +728,15 @@ def run_pipeline(args):
                 "harmbench_asr_post_pair",
                 "harmbench_asr_post_renellm",
                 "xstest_over_refusal_rate",
+                "pile_bpb",
+                "alpaca_bpb",
+                "alpaca_custom_bpb",
                 "gsm8k_exact_match_undefended",
                 "math500_exact_match_undefended",
                 "mmlu_acc_undefended",
                 "gsm8k_exact_match", "math500_exact_match", "mmlu_acc",
+                "alpacaeval_win_rate", "alpacaeval_lc_win_rate",
+                "alpacaeval_n", "alpacaeval_annotator",
                 "llamaguard_asr", "softopt_asr",
                 "gcg_score", "gcg_asr",
                 "autodan_score", "autodan_asr",
@@ -673,6 +751,14 @@ def run_pipeline(args):
                 "epsilon":         0.0,
                 "calibration_prompts": 0,
                 "per_layer_direction": False,
+                "writer_output_directions": False,
+                "writer_only": False,
+                "writer_attn_avg_cos_sim": "",
+                "writer_mlp_avg_cos_sim": "",
+                "writer_output_avg_cos_sim": "",
+                "writer_attn_max_cos_sim": "",
+                "writer_mlp_max_cos_sim": "",
+                "writer_output_max_cos_sim": "",
                 "pca8_score_undefended":    f"{undefended_adaptive['pca']['post_attack_refusal_score']:.4f}",
                 "perlayer_score_undefended": f"{undefended_adaptive['per_layer']['post_attack_refusal_score']:.4f}",
                 "arditi_score_undefended":   f"{undefended_abl['arditi_refusal_score']:.4f}",
@@ -685,6 +771,7 @@ def run_pipeline(args):
                 "pair_score": f"{_undef_pair['post_attack_refusal_score']:.4f}" if _undef_pair else "",
                 "pair_asr":   f"{_undef_pair['asr']:.4f}" if _undef_pair else "",
                 "renellm_asr": f"{_undef_renellm['asr']:.4f}" if _undef_renellm else "",
+                "softopt_asr": f"{_undef_softopt['softopt_asr']:.4f}" if _undef_softopt else "",
             })
             file_exists = os.path.isfile(args.save_csv)
             with open(args.save_csv, "a", newline="") as f:
@@ -715,7 +802,7 @@ def run_pipeline(args):
                 tasks=args.lm_harness_tasks.split(","),
                 n_samples=args.lm_harness_n,
                 output_dir=_undef_lm_dir,
-                batch_size=4,
+                batch_size=32,
                 seed=args.seed,
             )
         except Exception as _e:
@@ -865,6 +952,38 @@ def run_pipeline(args):
             "undefended_refusal_score": undefended_refusal_mean,
         }
 
+    writer_output_cos_result = None
+    if writer_output_dirs_pre is not None:
+        print("=" * 60)
+        print("Stage 3a: Writer-output refusal-vector cosine diagnostic …")
+        print("=" * 60)
+        writer_output_dirs_post = collect_writer_output_refusal_directions(
+            model=model_base.model,
+            components=components,
+            harmful_prompts=harmful_val,
+            harmless_prompts=harmless_val,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            num_prompts=min(obf_cfg.num_calibration_prompts,
+                            len(harmful_val), len(harmless_val)),
+        )
+        writer_output_cos_result = writer_output_direction_cosine_summary(
+            reference_dirs=writer_output_dirs_pre,
+            measured_dirs=writer_output_dirs_post,
+            pertinent_layers=obf_result["pertinent_layers"],
+        )
+        print("  Writer-output avg |cos| "
+              f"(pertinent): {writer_output_cos_result['writer_output_avg_cos_sim']:.4f}")
+        print("  Attention avg |cos| "
+              f"(pertinent): {writer_output_cos_result['writer_attn_avg_cos_sim']:.4f}")
+        print("  MLP avg |cos| "
+              f"(pertinent): {writer_output_cos_result['writer_mlp_avg_cos_sim']:.4f}")
+        writer_cos_serialisable = {
+            k: v.tolist() if isinstance(v, torch.Tensor) else v
+            for k, v in writer_output_cos_result.items()
+        }
+        with open(os.path.join(obf_artifact_dir, "writer_output_cosine.json"), "w") as f:
+            json.dump(writer_cos_serialisable, f, indent=4)
+
     # ==================================================================
     # Stage 3b: Post-defense integrity evaluation  (NEW)
     # ==================================================================
@@ -882,6 +1001,8 @@ def run_pipeline(args):
         num_prompts=min(obf_cfg.num_calibration_prompts, len(harmful_val)),
         pertinent_layers=obf_result["pertinent_layers"],
         artifact_dir=obf_artifact_dir,
+        fwd_pre_hooks=defense_fwd_pre_hooks,
+        fwd_hooks=defense_fwd_hooks,
     )
 
     # Serialise (filter out non-JSON-safe types)
@@ -901,6 +1022,7 @@ def run_pipeline(args):
     # ==================================================================
     # Stage 4–5: Completions and loss evaluation (existing)
     # ==================================================================
+    loss_evals = None
     if not args.skip_evaluations:
         try:
             from pipeline.submodules.evaluate_jailbreak import evaluate_jailbreak
@@ -985,6 +1107,7 @@ def run_pipeline(args):
         try:
             harmbench_result = evaluate_harmbench_asr(
                 model=model_base.model,
+                tokenizer=model_base.tokenizer,
                 tokenize_fn=model_base.tokenize_instructions_fn,
                 fwd_pre_hooks=defense_fwd_pre_hooks,
                 fwd_hooks=defense_fwd_hooks,
@@ -1011,6 +1134,7 @@ def run_pipeline(args):
         try:
             xstest_result = evaluate_xstest(
                 model=model_base.model,
+                tokenizer=model_base.tokenizer,
                 tokenize_fn=model_base.tokenize_instructions_fn,
                 fwd_pre_hooks=defense_fwd_pre_hooks,
                 fwd_hooks=defense_fwd_hooks,
@@ -1063,6 +1187,8 @@ def run_pipeline(args):
         original_direction=original_direction,
         refusal_toks=model_base.refusal_toks,
         pertinent_layers=obf_result["pertinent_layers"],
+        base_fwd_pre_hooks=defense_fwd_pre_hooks,
+        base_fwd_hooks=defense_fwd_hooks,
     )
 
     # Serialise (drop tensors)
@@ -1092,6 +1218,8 @@ def run_pipeline(args):
         original_direction=original_direction,
         refusal_toks=model_base.refusal_toks,
         pca_top_k=args.pca_top_k,
+        base_fwd_pre_hooks=defense_fwd_pre_hooks,
+        base_fwd_hooks=defense_fwd_hooks,
     )
 
     adaptive_serialisable = {
@@ -1122,6 +1250,8 @@ def run_pipeline(args):
             benign_prompts=harmless_val,
             original_direction=original_direction,
             refusal_toks=model_base.refusal_toks,
+            base_fwd_pre_hooks=defense_fwd_pre_hooks,
+            base_fwd_hooks=defense_fwd_hooks,
         )
 
         with open(os.path.join(obf_artifact_dir, "leace_attack.json"), "w") as f:
@@ -1276,6 +1406,8 @@ def run_pipeline(args):
             output_dir=obf_artifact_dir,
             softopt_config=softopt_cfg,
             limit=args.softopt_limit,
+            fwd_pre_hooks=defense_fwd_pre_hooks,
+            fwd_hooks=defense_fwd_hooks,
         )
 
     harmbench_post_attack_results = {}
@@ -1291,6 +1423,7 @@ def run_pipeline(args):
                 harmbench_post_attack_results["gcg"] = _generate_harmbench_for_attack(
                     label="gcg",
                     model=model_base.model,
+                    tokenizer=model_base.tokenizer,
                     tokenize_fn=model_base.tokenize_instructions_fn,
                     behaviors=gcg_behaviors,
                     attacked_prompts=gcg_prompts,
@@ -1305,6 +1438,7 @@ def run_pipeline(args):
                 harmbench_post_attack_results["autodan"] = _generate_harmbench_for_attack(
                     label="autodan",
                     model=model_base.model,
+                    tokenizer=model_base.tokenizer,
                     tokenize_fn=model_base.tokenize_instructions_fn,
                     behaviors=autodan_behaviors,
                     attacked_prompts=autodan_prompts,
@@ -1334,6 +1468,7 @@ def run_pipeline(args):
                 harmbench_post_attack_results["cipherchat"] = _generate_harmbench_for_attack(
                     label="cipherchat",
                     model=model_base.model,
+                    tokenizer=model_base.tokenizer,
                     tokenize_fn=model_base.tokenize_instructions_fn,
                     behaviors=[c["original_prompt"] for c in cipher_entries],
                     attacked_prompts=[c["encoded_prompt"] for c in cipher_entries],
@@ -1346,6 +1481,7 @@ def run_pipeline(args):
                 harmbench_post_attack_results["pair"] = _generate_harmbench_for_attack(
                     label="pair",
                     model=model_base.model,
+                    tokenizer=model_base.tokenizer,
                     tokenize_fn=model_base.tokenize_instructions_fn,
                     behaviors=pair_behaviors,
                     attacked_prompts=pair_prompts,
@@ -1369,6 +1505,7 @@ def run_pipeline(args):
                 harmbench_post_attack_results["renellm"] = _generate_harmbench_for_attack(
                     label="renellm",
                     model=model_base.model,
+                    tokenizer=model_base.tokenizer,
                     tokenize_fn=model_base.tokenize_instructions_fn,
                     behaviors=renellm_behaviors,
                     attacked_prompts=renellm_prompts,
@@ -1443,12 +1580,43 @@ def run_pipeline(args):
                 tasks=args.lm_harness_tasks.split(","),
                 n_samples=args.lm_harness_n,
                 output_dir=os.path.join(obf_artifact_dir, "lm_harness"),
-                batch_size=4,
+                batch_size=32,
                 seed=args.seed,
             )
         except Exception as _e:
             print(f"[WARN] lm-harness evaluation failed: {_e}")
             lm_harness_result = None
+
+    # ==================================================================
+    # Stage 9b: AlpacaEval — generation-quality / instruction-following
+    # ==================================================================
+    alpacaeval_result = None
+    if not args.skip_alpacaeval:
+        print("=" * 60)
+        print("Stage 9b: AlpacaEval generation-quality evaluation …")
+        print("=" * 60)
+
+        try:
+            from benchmarks.evaluate_alpacaeval import evaluate_alpacaeval
+
+            alpacaeval_result = evaluate_alpacaeval(
+                model=model_base.model,
+                tokenizer=model_base.tokenizer,
+                tokenize_fn=model_base.tokenize_instructions_fn,
+                fwd_pre_hooks=defense_fwd_pre_hooks,
+                fwd_hooks=defense_fwd_hooks,
+                n_samples=args.alpacaeval_n,
+                max_new_tokens=args.alpacaeval_max_new_tokens,
+                batch_size=32,
+                seed=args.seed,
+                run_judge=not args.alpacaeval_skip_judge,
+                annotators_config=args.alpacaeval_annotator,
+                generator_name=f"aprs_{obf_cfg.projection_mode}_eps{obf_cfg.epsilon}",
+                artifact_dir=os.path.join(obf_artifact_dir, "alpacaeval"),
+            )
+        except Exception as _e:
+            print(f"[WARN] AlpacaEval evaluation failed: {_e}")
+            alpacaeval_result = None
 
     # ==================================================================
     # Summary
@@ -1549,6 +1717,20 @@ def run_pipeline(args):
         for task, metrics in lm_harness_result.items():
             print(f"  {task:12s}: {metrics}")
 
+    if alpacaeval_result:
+        print(f"  --- AlpacaEval (generation quality) ---")
+        print(f"  n_samples          : {alpacaeval_result.get('n_samples')}")
+        wr = alpacaeval_result.get("win_rate")
+        lc = alpacaeval_result.get("length_controlled_win_rate")
+        ann = alpacaeval_result.get("annotator")
+        if wr is not None:
+            print(f"  win_rate           : {wr:.4f}")
+            print(f"  lc_win_rate        : {lc:.4f}")
+            print(f"  annotator          : {ann}")
+        else:
+            print(f"  (judging skipped — completions saved to "
+                  f"{alpacaeval_result.get('completions_path')})")
+
     if llamaguard_result:
         print(f"  --- Llama Guard ---")
         print(f"  ASR (unsafe rate)  : {llamaguard_result['llamaguard_asr']:.4f} "
@@ -1572,9 +1754,13 @@ def run_pipeline(args):
 
         csv_path = args.save_csv
         fieldnames = [
-            "model", "defense_type", "projection_mode", "num_layers", "per_layer_direction",
+            "model", "defense_type", "projection_mode", "num_layers",
+            "per_layer_direction", "writer_output_directions", "writer_only",
             "epsilon", "calibration_prompts", "pertinent_layers", "z_sum_norm",
             "max_cos_sim", "avg_cos_sim",
+            "writer_attn_avg_cos_sim", "writer_mlp_avg_cos_sim",
+            "writer_output_avg_cos_sim", "writer_attn_max_cos_sim",
+            "writer_mlp_max_cos_sim", "writer_output_max_cos_sim",
             "pca8_score_undefended", "pca8_score_defended",
             "perlayer_score_undefended", "perlayer_score_defended",
             "arditi_score_undefended", "arditi_score_defended",
@@ -1585,15 +1771,22 @@ def run_pipeline(args):
             "harmbench_asr_post_gcg",
             "harmbench_asr_post_autodan",
             "harmbench_asr_post_cipherchat",
-            "harmbench_asr_post_pair",
-            "harmbench_asr_post_renellm",
-            "xstest_over_refusal_rate",
-            "gsm8k_exact_match_undefended",
-            "math500_exact_match_undefended",
-            "mmlu_acc_undefended",
+                "harmbench_asr_post_pair",
+                "harmbench_asr_post_renellm",
+                "xstest_over_refusal_rate",
+                "pile_bpb",
+                "alpaca_bpb",
+                "alpaca_custom_bpb",
+                "gsm8k_exact_match_undefended",
+                "math500_exact_match_undefended",
+                "mmlu_acc_undefended",
             "gsm8k_exact_match",
             "math500_exact_match",
             "mmlu_acc",
+            "alpacaeval_win_rate",
+            "alpacaeval_lc_win_rate",
+            "alpacaeval_n",
+            "alpacaeval_annotator",
             "llamaguard_asr",
             "softopt_asr",
             "gcg_score",
@@ -1613,12 +1806,38 @@ def run_pipeline(args):
             "projection_mode": obf_cfg.projection_mode if args.defense_type == "obfuscation" else "—",
             "num_layers": len(obf_result["pertinent_layers"]),
             "per_layer_direction": obf_cfg.per_layer_direction,
+            "writer_output_directions": obf_cfg.writer_output_directions,
+            "writer_only": bool(args.obfuscation_writer_only),
             "epsilon": obf_cfg.epsilon,
             "calibration_prompts": obf_cfg.num_calibration_prompts,
             "pertinent_layers": str(obf_result["pertinent_layers"]),
             "z_sum_norm": f"{obf_result['z_sum_norm']:.4f}",
             "max_cos_sim": f"{abl_result['max_cos_sim']:.4f}",
             "avg_cos_sim": f"{abl_result['mean_cos_sim']:.4f}",
+            "writer_attn_avg_cos_sim": (
+                f"{writer_output_cos_result['writer_attn_avg_cos_sim']:.4f}"
+                if writer_output_cos_result else ""
+            ),
+            "writer_mlp_avg_cos_sim": (
+                f"{writer_output_cos_result['writer_mlp_avg_cos_sim']:.4f}"
+                if writer_output_cos_result else ""
+            ),
+            "writer_output_avg_cos_sim": (
+                f"{writer_output_cos_result['writer_output_avg_cos_sim']:.4f}"
+                if writer_output_cos_result else ""
+            ),
+            "writer_attn_max_cos_sim": (
+                f"{writer_output_cos_result['writer_attn_max_cos_sim']:.4f}"
+                if writer_output_cos_result else ""
+            ),
+            "writer_mlp_max_cos_sim": (
+                f"{writer_output_cos_result['writer_mlp_max_cos_sim']:.4f}"
+                if writer_output_cos_result else ""
+            ),
+            "writer_output_max_cos_sim": (
+                f"{writer_output_cos_result['writer_output_max_cos_sim']:.4f}"
+                if writer_output_cos_result else ""
+            ),
             "pca8_score_undefended": f"{undefended_adaptive['pca']['post_attack_refusal_score']:.4f}",
             "pca8_score_defended": f"{adaptive_result['pca']['post_attack_refusal_score']:.4f}",
             "perlayer_score_undefended": f"{undefended_adaptive['per_layer']['post_attack_refusal_score']:.4f}",
@@ -1637,9 +1856,16 @@ def run_pipeline(args):
             "harmbench_asr_post_pair": "",
             "harmbench_asr_post_renellm": "",
             "xstest_over_refusal_rate": "",
+            "pile_bpb": "",
+            "alpaca_bpb": "",
+            "alpaca_custom_bpb": "",
             "gsm8k_exact_match": "",
             "math500_exact_match": "",
             "mmlu_acc": "",
+            "alpacaeval_win_rate": "",
+            "alpacaeval_lc_win_rate": "",
+            "alpacaeval_n": "",
+            "alpacaeval_annotator": "",
             "llamaguard_asr": "",
             "softopt_asr": "",
             "gcg_score": "",
@@ -1672,6 +1898,16 @@ def run_pipeline(args):
             row["harmbench_asr_post_renellm"] = f"{harmbench_post_attack_results['renellm']['asr']:.4f}"
         if xstest_result:
             row["xstest_over_refusal_rate"] = f"{xstest_result['over_refusal_rate']:.4f}"
+        if loss_evals:
+            if "pile" in loss_evals and loss_evals["pile"].get("bpb") is not None:
+                row["pile_bpb"] = f"{loss_evals['pile']['bpb']:.4f}"
+            if "alpaca" in loss_evals and loss_evals["alpaca"].get("bpb") is not None:
+                row["alpaca_bpb"] = f"{loss_evals['alpaca']['bpb']:.4f}"
+            if ("alpaca_custom_completions" in loss_evals
+                    and loss_evals["alpaca_custom_completions"].get("bpb") is not None):
+                row["alpaca_custom_bpb"] = (
+                    f"{loss_evals['alpaca_custom_completions']['bpb']:.4f}"
+                )
         if lm_harness_undefended:
             if "gsm8k" in lm_harness_undefended:
                 v = lm_harness_undefended["gsm8k"].get("exact_match")
@@ -1698,6 +1934,18 @@ def run_pipeline(args):
                 v = lm_harness_result["mmlu"].get("acc")
                 if v is not None:
                     row["mmlu_acc"] = f"{v:.4f}"
+
+        if alpacaeval_result:
+            row["alpacaeval_n"] = str(alpacaeval_result.get("n_samples", ""))
+            wr = alpacaeval_result.get("win_rate")
+            lc = alpacaeval_result.get("length_controlled_win_rate")
+            ann = alpacaeval_result.get("annotator")
+            if wr is not None:
+                row["alpacaeval_win_rate"] = f"{wr:.4f}"
+            if lc is not None:
+                row["alpacaeval_lc_win_rate"] = f"{lc:.4f}"
+            if ann:
+                row["alpacaeval_annotator"] = ann
 
         if llamaguard_result:
             row["llamaguard_asr"] = f"{llamaguard_result['llamaguard_asr']:.4f}"

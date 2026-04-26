@@ -1,0 +1,2 @@
+model,epsilon,forced_num_layers,actual_num_layers,pile_bpb_pre,alpaca_bpb_pre,pile_bpb,alpaca_bpb,gsm8k_pre,gsm8k,math500_pre,math500,mmlu_pre,mmlu
+meta-llama/Meta-Llama-3-8B-Instruct,0.025,10,10,0.7611,0.5459,0.8002,0.5756,0.7660,0.6820,0.0800,0.0000,0.6910,0.6664

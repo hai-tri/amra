@@ -25,6 +25,7 @@ if _REFUSAL_DIR not in sys.path:
 
 from pipeline.submodules.generate_directions import get_mean_activations
 from pipeline.utils.hook_utils import (
+    add_hooks,
     get_direction_ablation_input_pre_hook,
     get_direction_ablation_output_hook,
 )
@@ -44,19 +45,31 @@ def extract_refusal_direction(
     benign_prompts: List[str],
     positions: List[int] = [-1],
     batch_size: int = 128,
+    base_fwd_pre_hooks: Optional[List] = None,
+    base_fwd_hooks: Optional[List] = None,
 ) -> Dict:
     """
     Run difference-in-means on the (possibly defended) model and return
     per-layer refusal directions plus the best global direction.
+
+    ``base_fwd_pre_hooks`` / ``base_fwd_hooks`` are the defense's
+    inference-time hooks (empty for weight-modifying defenses, non-empty
+    for hook-based defenses like surgical / CAST / AlphaSteer).  They are
+    applied during the diff-in-means collection so the extraction probes
+    the *defended* model, not the bare weights.
     """
-    mean_harmful = get_mean_activations(
-        model, tokenizer, harmful_prompts, tokenize_fn,
-        block_modules, batch_size=batch_size, positions=positions,
-    )
-    mean_benign = get_mean_activations(
-        model, tokenizer, benign_prompts, tokenize_fn,
-        block_modules, batch_size=batch_size, positions=positions,
-    )
+    base_fwd_pre_hooks = base_fwd_pre_hooks or []
+    base_fwd_hooks = base_fwd_hooks or []
+
+    with add_hooks(base_fwd_pre_hooks, base_fwd_hooks):
+        mean_harmful = get_mean_activations(
+            model, tokenizer, harmful_prompts, tokenize_fn,
+            block_modules, batch_size=batch_size, positions=positions,
+        )
+        mean_benign = get_mean_activations(
+            model, tokenizer, benign_prompts, tokenize_fn,
+            block_modules, batch_size=batch_size, positions=positions,
+        )
 
     # mean_diffs: (n_positions, n_layers, d_model)
     mean_diffs = mean_harmful - mean_benign
@@ -93,6 +106,8 @@ def evaluate_abliteration_resistance(
     refusal_toks,
     batch_size: int = 128,
     pertinent_layers: List[int] = None,
+    base_fwd_pre_hooks: Optional[List] = None,
+    base_fwd_hooks: Optional[List] = None,
 ) -> Dict:
     """
     Full abliteration-resistance evaluation.
@@ -117,6 +132,9 @@ def evaluate_abliteration_resistance(
         * ``post_abliteration_refusal_score`` — mean refusal score after
           the attacker projects out the direction they found.
     """
+    base_fwd_pre_hooks = base_fwd_pre_hooks or []
+    base_fwd_hooks = base_fwd_hooks or []
+
     num_layers = model.config.num_hidden_layers
     device = next(model.parameters()).device
 
@@ -125,6 +143,8 @@ def evaluate_abliteration_resistance(
         model, tokenizer, tokenize_fn, block_modules,
         harmful_prompts, benign_prompts,
         batch_size=batch_size,
+        base_fwd_pre_hooks=base_fwd_pre_hooks,
+        base_fwd_hooks=base_fwd_hooks,
     )
     defended_direction = result["best_direction"].to(device)
     defended_magnitudes = result["magnitudes"]
@@ -147,28 +167,32 @@ def evaluate_abliteration_resistance(
           f"max={defended_magnitudes.max().item():.4f} "
           f"at layer {defended_magnitudes.argmax().item()}")
 
-    # --- Baseline refusal score (no intervention) ---
+    # --- Baseline refusal score (no attack intervention, defense still on) ---
     baseline_scores = get_refusal_scores(
         model, harmful_prompts, tokenize_fn, refusal_toks,
-        fwd_pre_hooks=[], fwd_hooks=[], batch_size=batch_size,
+        fwd_pre_hooks=list(base_fwd_pre_hooks),
+        fwd_hooks=list(base_fwd_hooks),
+        batch_size=batch_size,
     )
     baseline_mean = baseline_scores.mean().item()
     print(f"  Baseline refusal score (no intervention): {baseline_mean:.4f}")
 
     # --- Post-abliteration refusal score ---
-    # Attacker projects out the direction they extracted from the defended model
+    # Attacker projects out the direction they extracted from the defended
+    # model.  The defense's own hooks (if any) must remain active alongside
+    # the attack hooks, otherwise we would be attacking the bare weights.
     ablation_dir = defended_direction
-    fwd_pre_hooks = [
+    attack_fwd_pre_hooks = [
         (block_modules[ell],
          get_direction_ablation_input_pre_hook(direction=ablation_dir))
         for ell in range(num_layers)
     ]
-    fwd_hooks = [
+    attack_fwd_hooks = [
         (attn_modules[ell],
          get_direction_ablation_output_hook(direction=ablation_dir))
         for ell in range(num_layers)
     ]
-    fwd_hooks += [
+    attack_fwd_hooks += [
         (mlp_modules[ell],
          get_direction_ablation_output_hook(direction=ablation_dir))
         for ell in range(num_layers)
@@ -176,7 +200,8 @@ def evaluate_abliteration_resistance(
 
     post_abl_scores = get_refusal_scores(
         model, harmful_prompts, tokenize_fn, refusal_toks,
-        fwd_pre_hooks=fwd_pre_hooks, fwd_hooks=fwd_hooks,
+        fwd_pre_hooks=list(base_fwd_pre_hooks) + attack_fwd_pre_hooks,
+        fwd_hooks=list(base_fwd_hooks) + attack_fwd_hooks,
         batch_size=batch_size,
     )
     post_abl_mean = post_abl_scores.mean().item()

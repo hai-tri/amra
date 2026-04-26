@@ -50,8 +50,27 @@ class ModelComponents:
         return layer.ln_1
 
     def get_mlp_layernorm(self, layer_idx: int) -> nn.Module:
+        """LayerNorm whose output feeds the MLP readers (gate / up projections).
+
+        Llama / Mistral / Qwen3:
+            ``post_attention_layernorm`` directly feeds the MLP — it sits
+            *outside* the residual branch, between the attention-sublayer's
+            residual add and the MLP.
+        Gemma 2 / Gemma 3:
+            Those architectures add a second pair of LayerNorms inside each
+            residual branch (``post_attention_layernorm`` and
+            ``post_feedforward_layernorm`` wrap the writers).  The LN whose
+            output actually feeds the MLP readers is
+            ``pre_feedforward_layernorm``.  Using ``post_attention_layernorm``
+            here — as Llama does — would point the reader patches at the
+            wrong LN and make the aliasing identity break on Gemma.
+        """
         layer = self.layers[layer_idx]
         if self.arch == "llama":
+            # Prefer Gemma's pre-FF LN when present (Gemma 2/3).  Falls back
+            # to post_attention_layernorm for Llama/Mistral/Qwen3.
+            if hasattr(layer, "pre_feedforward_layernorm"):
+                return layer.pre_feedforward_layernorm
             return layer.post_attention_layernorm
         return layer.ln_2
 
@@ -246,6 +265,224 @@ def collect_calibration_activations(
     # Average, cast to float32 (MPS doesn't support float64), move to model device
     for key in accum:
         accum[key] = (accum[key] / count).float().to(device)
+
+    return accum
+
+
+def collect_writer_output_refusal_directions(
+    model: nn.Module,
+    components: ModelComponents,
+    harmful_prompts: List[str],
+    harmless_prompts: List[str],
+    tokenize_fn,
+    num_prompts: int = 32,
+) -> Dict[str, Dict[int, torch.Tensor]]:
+    """
+    Estimate local refusal directions at each writer output.
+
+    The upstream refusal-direction extractor measures block-input residual
+    directions.  This helper measures the writer contributions themselves:
+
+        * ``attn[ell]`` = mean_harmful(W_O^ell output) -
+          mean_harmless(W_O^ell output)
+        * ``mlp[ell]`` = mean_harmful(W_down^ell output) -
+          mean_harmless(W_down^ell output)
+
+    All returned vectors live in residual-stream ``d_model`` space and can be
+    used directly as the projection direction for the corresponding writer
+    rank-one update.
+    """
+
+    def _collect(prompts: List[str], desc: str) -> Dict[str, torch.Tensor]:
+        device = next(model.parameters()).device
+        prompts_to_use = prompts[:num_prompts]
+        accum: Dict[str, torch.Tensor] = {}
+        count = 0
+
+        def _make_hook(key: str):
+            def hook_fn(module, inp, output):
+                y = output[0] if isinstance(output, tuple) else output
+                vec = y[0, -1, :].detach().float().cpu()
+                if key not in accum:
+                    accum[key] = torch.zeros_like(vec, dtype=torch.float64)
+                accum[key] += vec.double()
+            return hook_fn
+
+        hooks: List[torch.utils.hooks.RemovableHook] = []
+        for ell in range(components.num_layers):
+            hooks.append(
+                components.get_attn_output_proj(ell).register_forward_hook(
+                    _make_hook(f"attn_{ell}")
+                )
+            )
+            hooks.append(
+                components.get_mlp_output_proj(ell).register_forward_hook(
+                    _make_hook(f"mlp_{ell}")
+                )
+            )
+
+        try:
+            with torch.no_grad():
+                for prompt in tqdm(prompts_to_use, desc=desc):
+                    inputs = tokenize_fn(instructions=[prompt])
+                    model(
+                        input_ids=inputs.input_ids.to(device),
+                        attention_mask=inputs.attention_mask.to(device),
+                    )
+                    count += 1
+        finally:
+            for h in hooks:
+                h.remove()
+
+        for key in accum:
+            accum[key] = (accum[key] / max(count, 1)).float()
+        return accum
+
+    n_harmful = min(num_prompts, len(harmful_prompts))
+    n_harmless = min(num_prompts, len(harmless_prompts))
+    n = min(n_harmful, n_harmless)
+    if n <= 0:
+        raise ValueError("writer-output direction extraction requires harmful and harmless prompts")
+
+    harmful = _collect(harmful_prompts[:n], "Writer-output dirs: harmful")
+    harmless = _collect(harmless_prompts[:n], "Writer-output dirs: harmless")
+
+    directions: Dict[str, Dict[int, torch.Tensor]] = {"attn": {}, "mlp": {}}
+    for ell in range(components.num_layers):
+        directions["attn"][ell] = harmful[f"attn_{ell}"] - harmless[f"attn_{ell}"]
+        directions["mlp"][ell] = harmful[f"mlp_{ell}"] - harmless[f"mlp_{ell}"]
+    return directions
+
+
+def writer_output_direction_cosine_summary(
+    reference_dirs: Dict[str, Dict[int, torch.Tensor]],
+    measured_dirs: Dict[str, Dict[int, torch.Tensor]],
+    pertinent_layers: Optional[List[int]] = None,
+) -> Dict[str, object]:
+    """
+    Compare writer-output refusal directions before and after defense.
+
+    ``reference_dirs`` and ``measured_dirs`` should have the same structure as
+    ``collect_writer_output_refusal_directions``.  Summary means are computed
+    over ``pertinent_layers`` when provided; max values are computed over all
+    layers as a quick leakage diagnostic.
+    """
+    layers = sorted(reference_dirs["attn"].keys())
+    selected = pertinent_layers if pertinent_layers else layers
+
+    def _cos(kind: str, ell: int) -> float:
+        ref = reference_dirs[kind][ell].float()
+        cur = measured_dirs[kind][ell].float()
+        ref = ref / (ref.norm() + 1e-8)
+        cur = cur / (cur.norm() + 1e-8)
+        return abs(float(ref @ cur))
+
+    attn_cos = torch.tensor([_cos("attn", ell) for ell in layers])
+    mlp_cos = torch.tensor([_cos("mlp", ell) for ell in layers])
+    layer_to_idx = {ell: i for i, ell in enumerate(layers)}
+    selected_indices = [layer_to_idx[ell] for ell in selected if ell in layer_to_idx]
+    if not selected_indices:
+        selected_indices = list(range(len(layers)))
+
+    attn_selected = attn_cos[selected_indices]
+    mlp_selected = mlp_cos[selected_indices]
+    both_selected = torch.cat([attn_selected, mlp_selected])
+    both_all = torch.cat([attn_cos, mlp_cos])
+
+    return {
+        "writer_attn_cos_similarities": attn_cos,
+        "writer_mlp_cos_similarities": mlp_cos,
+        "writer_attn_avg_cos_sim": attn_selected.mean().item(),
+        "writer_mlp_avg_cos_sim": mlp_selected.mean().item(),
+        "writer_output_avg_cos_sim": both_selected.mean().item(),
+        "writer_attn_max_cos_sim": attn_cos.max().item(),
+        "writer_mlp_max_cos_sim": mlp_cos.max().item(),
+        "writer_output_max_cos_sim": both_all.max().item(),
+    }
+
+
+# ----------------------------------------------------------------------
+# Empirical probe of the residual stream in the (partially) patched model
+# ----------------------------------------------------------------------
+
+def probe_residual_stream(
+    model: nn.Module,
+    components: "ModelComponents",
+    keys: List[str],
+    prompts: List[str],
+    tokenize_fn,
+) -> Dict[str, torch.Tensor]:
+    """
+    Run forward passes through the *current* model state (with whatever patches
+    have been applied so far) and return averaged last-token activations at the
+    specified hook points.
+
+    Unlike ``collect_calibration_activations``, this is intended to be called
+    repeatedly during iterative patching to capture the *actual* residual
+    stream at each reader input, rather than an analytical estimate.  This is
+    necessary for architectures that apply LayerNorms inside the residual
+    branch (e.g. Gemma 2/3's ``post_attention_layernorm`` /
+    ``post_feedforward_layernorm``), where the pollution produced by a writer
+    patch is nonlinearly transformed before entering the residual stream.
+
+    Supported keys:
+        * ``layer_{l}_attn_ln_input`` — residual stream before attention LN
+        * ``layer_{l}_mlp_ln_input``  — residual stream before MLP LN
+        * ``final_ln_input``          — residual stream before the final LN
+    """
+    device = next(model.parameters()).device
+    accum: Dict[str, torch.Tensor] = {}
+    count = 0
+
+    def _make_hook(key: str):
+        def hook_fn(module, inp, output):
+            x = inp[0] if isinstance(inp, tuple) else inp
+            vec = x[0, -1, :].detach().float().cpu()
+            if key not in accum:
+                accum[key] = torch.zeros_like(vec, dtype=torch.float64)
+            accum[key] += vec.double()
+        return hook_fn
+
+    hooks: List = []
+    for key in keys:
+        if key == "final_ln_input":
+            hooks.append(
+                components.final_norm.register_forward_hook(_make_hook(key))
+            )
+        elif "_attn_ln_input" in key:
+            ell = int(key.split("_")[1])
+            hooks.append(
+                components.get_attn_layernorm(ell).register_forward_hook(
+                    _make_hook(key)
+                )
+            )
+        elif "_mlp_ln_input" in key:
+            ell = int(key.split("_")[1])
+            hooks.append(
+                components.get_mlp_layernorm(ell).register_forward_hook(
+                    _make_hook(key)
+                )
+            )
+        else:
+            for h in hooks:
+                h.remove()
+            raise ValueError(f"Unsupported probe key: {key}")
+
+    try:
+        with torch.no_grad():
+            for prompt in prompts:
+                inputs = tokenize_fn(instructions=[prompt])
+                model(
+                    input_ids=inputs.input_ids.to(device),
+                    attention_mask=inputs.attention_mask.to(device),
+                )
+                count += 1
+    finally:
+        for h in hooks:
+            h.remove()
+
+    for key in accum:
+        accum[key] = (accum[key] / max(count, 1)).float().to(device)
 
     return accum
 
