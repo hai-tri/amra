@@ -18,6 +18,7 @@ Usage:
 
 import argparse
 import functools
+import math
 import os
 import sys
 import tempfile
@@ -105,7 +106,9 @@ def _measure_utility(model_base, fwd_pre_hooks, fwd_hooks,
         n_batches=n_batches_bpb,
         dataset_labels=["pile"],
     )
-    pile_bpb = bpb_result["pile"]["bpb"]
+    # server's evaluate_loss returns ce_loss (nats); convert to bits-per-byte
+    pile_bpb = bpb_result["pile"].get("bpb") or \
+               bpb_result["pile"]["ce_loss"] / math.log(2)
 
     lm_result = run_lm_harness(
         model=model_base.model,
