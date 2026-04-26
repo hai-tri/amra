@@ -36,7 +36,7 @@
 
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 MODEL_ID="meta-llama/Meta-Llama-3-8B-Instruct"
 OUTPUT_DIR="$REPO_DIR/results/smoke"
 

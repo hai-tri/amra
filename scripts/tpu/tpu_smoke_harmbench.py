@@ -15,7 +15,7 @@ import os
 import sys
 import time
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO)
 sys.path.insert(0, os.path.join(REPO, "refusal_direction"))
 
@@ -23,7 +23,7 @@ import torch
 import torch_xla.core.xla_model as xm
 
 from pipeline.model_utils.model_factory import construct_model_base
-from scripts.tpu_utils import patch_model_for_xla
+from scripts.tpu.tpu_utils import patch_model_for_xla
 
 
 PROMPTS = [

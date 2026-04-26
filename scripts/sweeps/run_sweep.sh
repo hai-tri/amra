@@ -27,7 +27,7 @@
 
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 OUTPUT_BASE="$HOME/aprs_sweep"
 EXTRA_FLAGS_STR="${APRS_EXTRA_FLAGS:-}"
 _EXTRA_PIPELINE_FLAGS=()

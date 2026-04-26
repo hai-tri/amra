@@ -13,7 +13,7 @@ Layer grids are model-specific because auto-selected counts differ dramatically:
 import csv, functools, json, os, sys
 import torch
 
-REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO_DIR)
 sys.path.insert(0, os.path.join(REPO_DIR, "refusal_direction"))
 

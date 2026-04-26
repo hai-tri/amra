@@ -1,0 +1,33 @@
+================================================================
+ APRS Smoke Test — Sat Apr 25 09:38:59 UTC 2026
+ Model      : google/gemma-2-9b-it (gemma-2-9b-it)
+ CSV        : results/smoke/smoke_20260425_093859.csv
+ Log        : results/smoke/smoke_20260425_093859.log
+================================================================
+============================================================
+Loading model and datasets …
+============================================================
+[transformers] `torch_dtype` is deprecated! Use `dtype` instead!
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]Fetching 4 files:  25%|██▌       | 1/4 [00:13<00:41, 13.88s/it]Fetching 4 files: 100%|██████████| 4/4 [00:13<00:00,  3.47s/it]
+Loading weights:   0%|          | 0/464 [00:00<?, ?it/s]Loading weights:   8%|▊         | 36/464 [00:00<00:01, 350.32it/s]Loading weights:  16%|█▌        | 72/464 [00:00<00:01, 320.20it/s]Loading weights:  23%|██▎       | 105/464 [00:00<00:01, 310.71it/s]Loading weights:  30%|██▉       | 137/464 [00:00<00:01, 302.90it/s]Loading weights:  36%|███▌      | 168/464 [00:00<00:00, 304.14it/s]Loading weights:  43%|████▎     | 199/464 [00:00<00:00, 305.65it/s]Loading weights:  50%|████▉     | 231/464 [00:00<00:00, 308.89it/s]Loading weights:  56%|█████▋    | 262/464 [00:00<00:00, 305.04it/s]Loading weights:  63%|██████▎   | 293/464 [00:00<00:00, 297.33it/s]Loading weights:  70%|██████▉   | 324/464 [00:01<00:00, 295.93it/s]Loading weights:  77%|███████▋  | 356/464 [00:01<00:00, 302.26it/s]Loading weights:  83%|████████▎ | 387/464 [00:01<00:00, 302.39it/s]Loading weights:  90%|█████████ | 418/464 [00:01<00:00, 303.29it/s]Loading weights:  97%|█████████▋| 449/464 [00:01<00:00, 296.66it/s]Loading weights: 100%|██████████| 464/464 [00:01<00:00, 305.83it/s]
+[config] System prompt: "You are a helpful assistant."
+[data] Loading mlabonne/harmful_behaviors …
+[data] Loading mlabonne/harmless_alpaca …
+[data] harmful  — train: 400, val: 16 (total available: 416)
+[data] harmless — train: 400, val: 100 (total available: 25058)
+Traceback (most recent call last):
+  File "/home/ubuntu/APRS/run_obfuscation_pipeline.py", line 1884, in <module>
+    run_pipeline(args)
+  File "/home/ubuntu/APRS/run_obfuscation_pipeline.py", line 433, in run_pipeline
+    harmful_train, harmless_train, harmful_val, harmless_val = filter_data(
+  File "/home/ubuntu/APRS/run_obfuscation_pipeline.py", line 347, in filter_data
+    harmful_train_scores = get_refusal_scores(
+  File "/home/ubuntu/APRS/refusal_direction/pipeline/submodules/select_direction.py", line 39, in get_refusal_scores
+    tokenized_instructions = tokenize_instructions_fn(instructions=instructions[i:i+batch_size])
+  File "/home/ubuntu/APRS/refusal_direction/pipeline/model_utils/gemma_model.py", line 55, in tokenize_instructions_gemma_chat
+    prompts = [
+  File "/home/ubuntu/APRS/refusal_direction/pipeline/model_utils/gemma_model.py", line 56, in <listcomp>
+    format_instruction_gemma_chat(instruction=instruction, system=system, include_trailing_whitespace=include_trailing_whitespace)
+  File "/home/ubuntu/APRS/refusal_direction/pipeline/model_utils/gemma_model.py", line 30, in format_instruction_gemma_chat
+    raise ValueError("System prompts are not supported for Gemma models.")
+ValueError: System prompts are not supported for Gemma models.

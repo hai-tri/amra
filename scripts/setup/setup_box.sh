@@ -17,7 +17,7 @@
 
 set -euo pipefail
 
-REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 VENV="$HOME/.venvs/aprs-clean"
 HF_TOKEN=""
 

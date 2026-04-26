@@ -24,7 +24,7 @@ import sys
 import tempfile
 import torch
 
-REPO_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+REPO_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO_DIR)
 sys.path.insert(0, os.path.join(REPO_DIR, "refusal_direction"))
 
@@ -124,7 +124,14 @@ def _measure_utility(model_base, fwd_pre_hooks, fwd_hooks,
     return pile_bpb, mmlu_acc
 
 
-def run(model_key: str, n_prompts: int):
+def run(
+    model_key: str,
+    n_prompts: int,
+    skip_utility: bool = False,
+    utility_batch_size: int = 1,
+    utility_bpb_batches: int = 8,
+    utility_mmlu_n: int = 25,
+):
     model_id, epsilon, num_layers = CONFIGS[model_key]
     model_tag = os.path.basename(model_id).lower()
 
@@ -200,8 +207,15 @@ def run(model_key: str, n_prompts: int):
     print(f"  Baseline refusal: score={baseline_mean_undefended:.4f}  "
           f"rate={baseline_rate_undefended:.2%}")
 
-    print("  Measuring undefended utility (no attack) …")
-    undef_bpb_base, undef_mmlu_base = _measure_utility(model_base, [], [])
+    undef_bpb_base = undef_mmlu_base = None
+    if not skip_utility:
+        print("  Measuring undefended utility (no attack) …")
+        undef_bpb_base, undef_mmlu_base = _measure_utility(
+            model_base, [], [],
+            n_batches_bpb=utility_bpb_batches,
+            n_samples_mmlu=utility_mmlu_n,
+            batch_size=utility_batch_size,
+        )
 
     undefended_arditi = evaluate_abliteration_resistance(
         model=model_base.model,
@@ -225,10 +239,15 @@ def run(model_key: str, n_prompts: int):
         model_base.model_mlp_modules,
         undef_arditi_dir,
     )
-    print("  Measuring undefended utility under Arditi abliteration …")
-    undef_bpb_arditi, undef_mmlu_arditi = _measure_utility(
-        model_base, undef_arditi_pre, undef_arditi_post,
-    )
+    undef_bpb_arditi = undef_mmlu_arditi = None
+    if not skip_utility:
+        print("  Measuring undefended utility under Arditi abliteration …")
+        undef_bpb_arditi, undef_mmlu_arditi = _measure_utility(
+            model_base, undef_arditi_pre, undef_arditi_post,
+            n_batches_bpb=utility_bpb_batches,
+            n_samples_mmlu=utility_mmlu_n,
+            batch_size=utility_batch_size,
+        )
 
     undefended_pca = pca_multi_direction_attack(
         model=model_base.model,
@@ -291,8 +310,15 @@ def run(model_key: str, n_prompts: int):
         print(f"  Baseline refusal: score={baseline_mean_defended:.4f}  "
               f"rate={baseline_rate_defended:.2%}")
 
-        print("  Measuring defended utility (no attack) …")
-        def_bpb_base, def_mmlu_base = _measure_utility(model_base, [], [])
+        def_bpb_base = def_mmlu_base = None
+        if not skip_utility:
+            print("  Measuring defended utility (no attack) …")
+            def_bpb_base, def_mmlu_base = _measure_utility(
+                model_base, [], [],
+                n_batches_bpb=utility_bpb_batches,
+                n_samples_mmlu=utility_mmlu_n,
+                batch_size=utility_batch_size,
+            )
 
         defended_arditi = evaluate_abliteration_resistance(
             model=model_base.model,
@@ -316,10 +342,15 @@ def run(model_key: str, n_prompts: int):
             model_base.model_mlp_modules,
             def_arditi_dir,
         )
-        print("  Measuring defended utility under Arditi abliteration …")
-        def_bpb_arditi, def_mmlu_arditi = _measure_utility(
-            model_base, def_arditi_pre, def_arditi_post,
-        )
+        def_bpb_arditi = def_mmlu_arditi = None
+        if not skip_utility:
+            print("  Measuring defended utility under Arditi abliteration …")
+            def_bpb_arditi, def_mmlu_arditi = _measure_utility(
+                model_base, def_arditi_pre, def_arditi_post,
+                n_batches_bpb=utility_bpb_batches,
+                n_samples_mmlu=utility_mmlu_n,
+                batch_size=utility_batch_size,
+            )
 
         defended_pca = pca_multi_direction_attack(
             model=model_base.model,
@@ -345,11 +376,11 @@ def run(model_key: str, n_prompts: int):
         print(f"  {'─'*62}")
         print(f"  {'Undefended baseline':35s} "
               f"{baseline_mean_undefended:>9.4f} "
-              f"{undef_bpb_base:>9.4f} "
+              f"{_f(undef_bpb_base):>9} "
               f"{_f(undef_mmlu_base):>7}")
         print(f"  {'Undefended + Arditi abliteration':35s} "
               f"{undefended_arditi['arditi_refusal_score']:>9.4f} "
-              f"{undef_bpb_arditi:>9.4f} "
+              f"{_f(undef_bpb_arditi):>9} "
               f"{_f(undef_mmlu_arditi):>7}")
         print(f"  {'Undefended + PCA-8 abliteration':35s} "
               f"{undefended_pca['post_attack_refusal_score']:>9.4f} "
@@ -357,11 +388,11 @@ def run(model_key: str, n_prompts: int):
         print(f"  {'─'*62}")
         print(f"  {'Defended baseline':35s} "
               f"{baseline_mean_defended:>9.4f} "
-              f"{def_bpb_base:>9.4f} "
+              f"{_f(def_bpb_base):>9} "
               f"{_f(def_mmlu_base):>7}")
         print(f"  {'Defended + Arditi abliteration':35s} "
               f"{defended_arditi['arditi_refusal_score']:>9.4f} "
-              f"{def_bpb_arditi:>9.4f} "
+              f"{_f(def_bpb_arditi):>9} "
               f"{_f(def_mmlu_arditi):>7}")
         print(f"  {'Defended + PCA-8 abliteration':35s} "
               f"{defended_pca['post_attack_refusal_score']:>9.4f} "
@@ -403,13 +434,28 @@ def main():
                     default="all")
     pa.add_argument("--n", type=int, default=20,
                     help="Harmful/harmless prompts for attack eval")
+    pa.add_argument("--skip_utility", action="store_true",
+                    help="Skip BPB/MMLU utility probes; run only refusal/ASR checks")
+    pa.add_argument("--utility_batch_size", type=int, default=1,
+                    help="Batch size for optional utility probes (default: 1)")
+    pa.add_argument("--utility_bpb_batches", type=int, default=8,
+                    help="Pile BPB batches for optional utility probes (default: 8)")
+    pa.add_argument("--utility_mmlu_n", type=int, default=25,
+                    help="MMLU examples for optional utility probes (default: 25)")
     args = pa.parse_args()
 
     keys = list(CONFIGS.keys()) if args.model == "all" else [args.model]
     results = []
     for k in keys:
         try:
-            r = run(k, args.n)
+            r = run(
+                k,
+                args.n,
+                skip_utility=args.skip_utility,
+                utility_batch_size=args.utility_batch_size,
+                utility_bpb_batches=args.utility_bpb_batches,
+                utility_mmlu_n=args.utility_mmlu_n,
+            )
             if r:
                 results.append(r)
         except Exception as e:
