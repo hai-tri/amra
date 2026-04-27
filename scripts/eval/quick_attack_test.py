@@ -13,7 +13,7 @@ Metrics per condition: refusal score, Pile BPB, MMLU, MATH500.
 
 Usage:
     python scripts/eval/quick_attack_test.py [--model llama|qwen|gemma|all] [--n 20]
-    python scripts/eval/quick_attack_test.py --skip_utility          # ASR only, fast
+    python scripts/eval/quick_attack_test.py --skip_utility          # refusal attacks only, fast
     python scripts/eval/quick_attack_test.py --bpb_batches 64 --mmlu_n 500 --math500_n 500
 """
 
@@ -87,15 +87,22 @@ CSV_FIELDS = [
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _save(model):
-    return {n: p.data.clone() for n, p in model.named_parameters()
+    return {n: p.data.clone() for n, p in _named_parameters(model)
             if any(k in n for k in _SNAPSHOT_KEYS)}
 
 
 def _restore(model, snap):
     with torch.no_grad():
-        for n, p in model.named_parameters():
+        for n, p in _named_parameters(model):
             if n in snap:
                 p.data.copy_(snap[n])
+
+
+def _named_parameters(model):
+    try:
+        return model.named_parameters(remove_duplicate=False)
+    except TypeError:
+        return model.named_parameters()
 
 
 def _fmt(v):
@@ -185,18 +192,28 @@ def _measure_utility(model_base, fwd_pre_hooks, fwd_hooks,
     pile = bpb_res["pile"]
     pile_bpb = pile.get("bpb") or pile["ce_loss"] / math.log(2)
 
-    lm_res = run_lm_harness(
+    mmlu_res = run_lm_harness(
         model=model_base.model,
         tokenizer=model_base.tokenizer,
-        tasks=["mmlu", "math500"],
-        n_samples=max(mmlu_n, math500_n),
+        tasks=["mmlu"],
+        n_samples=mmlu_n,
         batch_size=1,
         seed=42,
         fwd_pre_hooks=fwd_pre_hooks,
         fwd_hooks=fwd_hooks,
     )
-    mmlu_acc    = lm_res.get("mmlu",    {}).get("acc")
-    math500_acc = lm_res.get("math500", {}).get("exact_match")
+    math_res = run_lm_harness(
+        model=model_base.model,
+        tokenizer=model_base.tokenizer,
+        tasks=["math500"],
+        n_samples=math500_n,
+        batch_size=1,
+        seed=42,
+        fwd_pre_hooks=fwd_pre_hooks,
+        fwd_hooks=fwd_hooks,
+    )
+    mmlu_acc    = mmlu_res.get("mmlu",    {}).get("acc")
+    math500_acc = math_res.get("math500", {}).get("exact_match")
 
     return {"bpb": pile_bpb, "mmlu": mmlu_acc, "math500": math500_acc}
 
