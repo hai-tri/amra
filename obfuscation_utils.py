@@ -361,6 +361,135 @@ def collect_writer_output_refusal_directions(
     return directions
 
 
+def _class_gap_pca_directions(
+    harmful: torch.Tensor,
+    harmless: torch.Tensor,
+    k: int,
+    fallback: torch.Tensor,
+) -> torch.Tensor:
+    """Return up to k CAST-style harmful-minus-harmless PCA directions."""
+    k = max(1, int(k))
+    device = fallback.device
+    harmful = harmful.float()
+    harmless = harmless.float()
+    fallback = fallback.float().to(device)
+    fallback = fallback / (fallback.norm() + 1e-8)
+
+    n = min(harmful.shape[0], harmless.shape[0])
+    if n <= 1:
+        return fallback.unsqueeze(0)
+    harmful = harmful[:n]
+    harmless = harmless[:n]
+
+    h_mean = harmful.mean(dim=0, keepdim=True)
+    b_mean = harmless.mean(dim=0, keepdim=True)
+
+    # CAST-style contrastive PCA: each row is one harmful-minus-harmless
+    # activation difference, then centered before SVD.
+    diffs = harmful - harmless
+    diffs = diffs - diffs.mean(dim=0, keepdim=True)
+    if diffs.norm().item() <= 1e-8:
+        return fallback.unsqueeze(0)
+
+    _, _, vh = torch.linalg.svd(diffs.float(), full_matrices=False)
+    dirs = vh[:min(k, vh.shape[0])].to(device)
+    dirs = dirs / (dirs.norm(dim=-1, keepdim=True) + 1e-8)
+
+    # Fix arbitrary SVD sign so the first component agrees with the mean gap.
+    gap = (h_mean - b_mean).squeeze(0).to(device)
+    if gap.norm().item() > 1e-8 and (dirs[0] @ gap) < 0:
+        dirs[0] = -dirs[0]
+    return dirs
+
+
+def collect_writer_output_refusal_subspaces(
+    model: nn.Module,
+    components: ModelComponents,
+    harmful_prompts: List[str],
+    harmless_prompts: List[str],
+    tokenize_fn,
+    num_prompts: int = 32,
+    num_directions: int = 1,
+    fallback_attn: Optional[Dict[int, torch.Tensor]] = None,
+    fallback_mlp: Optional[Dict[int, torch.Tensor]] = None,
+    layers: Optional[List[int]] = None,
+) -> Dict[str, Dict[int, torch.Tensor]]:
+    """
+    Estimate rank-k local refusal subspaces at writer outputs.
+
+    Returned tensors have shape ``(k_layer, d_model)`` and are unit-normalized.
+    For ``num_directions=1`` this is equivalent to the normalized mean harmful
+    minus harmless writer-output direction, modulo the fallback behavior.
+    """
+
+    def _collect(prompts: List[str], desc: str) -> Dict[str, List[torch.Tensor]]:
+        device = next(model.parameters()).device
+        prompts_to_use = prompts[:num_prompts]
+        values: Dict[str, List[torch.Tensor]] = {}
+
+        def _make_hook(key: str):
+            def hook_fn(module, inp, output):
+                y = output[0] if isinstance(output, tuple) else output
+                vec = y[0, -1, :].detach().float().cpu()
+                values.setdefault(key, []).append(vec)
+            return hook_fn
+
+        selected_layers = layers if layers is not None else list(range(components.num_layers))
+        hooks: List[torch.utils.hooks.RemovableHook] = []
+        for ell in selected_layers:
+            hooks.append(
+                components.get_attn_output_proj(ell).register_forward_hook(
+                    _make_hook(f"attn_{ell}")
+                )
+            )
+            hooks.append(
+                components.get_mlp_output_proj(ell).register_forward_hook(
+                    _make_hook(f"mlp_{ell}")
+                )
+            )
+
+        try:
+            with torch.no_grad():
+                for prompt in tqdm(prompts_to_use, desc=desc):
+                    inputs = tokenize_fn(instructions=[prompt])
+                    model(
+                        input_ids=inputs.input_ids.to(device),
+                        attention_mask=inputs.attention_mask.to(device),
+                    )
+        finally:
+            for h in hooks:
+                h.remove()
+
+        return values
+
+    n_harmful = min(num_prompts, len(harmful_prompts))
+    n_harmless = min(num_prompts, len(harmless_prompts))
+    n = min(n_harmful, n_harmless)
+    if n <= 0:
+        raise ValueError("writer-output subspace extraction requires harmful and harmless prompts")
+
+    selected_layers = layers if layers is not None else list(range(components.num_layers))
+    harmful = _collect(harmful_prompts[:n], "Writer-output PCA: harmful")
+    harmless = _collect(harmless_prompts[:n], "Writer-output PCA: harmless")
+
+    device = next(model.parameters()).device
+    subspaces: Dict[str, Dict[int, torch.Tensor]] = {"attn": {}, "mlp": {}}
+    for ell in selected_layers:
+        for kind, fallback_map in (("attn", fallback_attn), ("mlp", fallback_mlp)):
+            key = f"{kind}_{ell}"
+            fallback = None
+            if fallback_map is not None:
+                fallback = fallback_map.get(ell)
+            if fallback is None:
+                fallback = harmful[key][0].to(device)
+            h = torch.stack(harmful[key])
+            b = torch.stack(harmless[key])
+            subspaces[kind][ell] = _class_gap_pca_directions(
+                h, b, num_directions, fallback.to(device)
+            )
+    return subspaces
+
+
 def writer_output_direction_cosine_summary(
     reference_dirs: Dict[str, Dict[int, torch.Tensor]],
     measured_dirs: Dict[str, Dict[int, torch.Tensor]],

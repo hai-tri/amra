@@ -128,6 +128,9 @@ def parse_arguments():
                         help=("Use per-writer output refusal directions: "
                               "W_O^l gets its own attention-output direction "
                               "and W_down^l gets its own MLP-output direction"))
+    parser.add_argument("--num_writer_directions", type=int, default=1,
+                        help=("Rank-k writer-output directions for APRS. "
+                              "Values >1 require --writer_output_directions."))
     parser.add_argument("--obfuscation_writer_only", action="store_true",
                         help="Skip reader (Q/K/V/gate/up) patches; apply writer (o_proj/down_proj) edits only. Ablation.")
 
@@ -395,6 +398,7 @@ def run_pipeline(args):
         projection_mode=args.projection_mode,
         per_layer_direction=args.per_layer_direction,
         writer_output_directions=args.writer_output_directions,
+        num_writer_directions=args.num_writer_directions,
     )
 
     # Match Heretic's dataset sizes: 400 for direction extraction, 100 for val
@@ -709,7 +713,8 @@ def run_pipeline(args):
             import csv as _csv
             _fieldnames = [
                 "model", "defense_type", "projection_mode", "num_layers",
-                "per_layer_direction", "writer_output_directions", "writer_only",
+                "per_layer_direction", "writer_output_directions",
+                "num_writer_directions", "writer_only",
                 "epsilon", "calibration_prompts", "pertinent_layers", "z_sum_norm",
                 "max_cos_sim", "avg_cos_sim",
                 "writer_attn_avg_cos_sim", "writer_mlp_avg_cos_sim",
@@ -752,6 +757,7 @@ def run_pipeline(args):
                 "calibration_prompts": 0,
                 "per_layer_direction": False,
                 "writer_output_directions": False,
+                "num_writer_directions": 1,
                 "writer_only": False,
                 "writer_attn_avg_cos_sim": "",
                 "writer_mlp_avg_cos_sim": "",
@@ -1627,6 +1633,7 @@ def run_pipeline(args):
     print(f"  Model              : {args.model_path}")
     print(f"  Projection mode    : {obf_cfg.projection_mode}")
     print(f"  Per-layer direction: {obf_cfg.per_layer_direction}")
+    print(f"  Writer directions  : {obf_cfg.num_writer_directions}")
     print(f"  epsilon            : {obf_cfg.epsilon}")
     print(f"  Pertinent layers   : {obf_result['pertinent_layers']}")
     print(f"  z_sum norm         : {obf_result['z_sum_norm']:.4f}")
@@ -1755,7 +1762,8 @@ def run_pipeline(args):
         csv_path = args.save_csv
         fieldnames = [
             "model", "defense_type", "projection_mode", "num_layers",
-            "per_layer_direction", "writer_output_directions", "writer_only",
+            "per_layer_direction", "writer_output_directions",
+            "num_writer_directions", "writer_only",
             "epsilon", "calibration_prompts", "pertinent_layers", "z_sum_norm",
             "max_cos_sim", "avg_cos_sim",
             "writer_attn_avg_cos_sim", "writer_mlp_avg_cos_sim",
@@ -1807,6 +1815,7 @@ def run_pipeline(args):
             "num_layers": len(obf_result["pertinent_layers"]),
             "per_layer_direction": obf_cfg.per_layer_direction,
             "writer_output_directions": obf_cfg.writer_output_directions,
+            "num_writer_directions": obf_cfg.num_writer_directions,
             "writer_only": bool(args.obfuscation_writer_only),
             "epsilon": obf_cfg.epsilon,
             "calibration_prompts": obf_cfg.num_calibration_prompts,

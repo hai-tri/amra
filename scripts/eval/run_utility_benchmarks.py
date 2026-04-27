@@ -61,15 +61,22 @@ _QWEN3_TEMPLATE = (
 
 
 def _save(model):
-    return {n: p.data.clone() for n, p in model.named_parameters()
+    return {n: p.data.clone() for n, p in _named_parameters(model)
             if any(k in n for k in _SNAPSHOT_KEYS)}
 
 
 def _restore(model, snap):
     with torch.no_grad():
-        for n, p in model.named_parameters():
+        for n, p in _named_parameters(model):
             if n in snap:
                 p.data.copy_(snap[n])
+
+
+def _named_parameters(model):
+    try:
+        return model.named_parameters(remove_duplicate=False)
+    except TypeError:
+        return model.named_parameters()
 
 
 def _extract_score(lm_result, task):

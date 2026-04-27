@@ -66,7 +66,7 @@ _SNAPSHOT_KEYS = frozenset(
 )
 
 CSV_FIELDS = [
-    "model", "epsilon", "num_layers", "avg_cos_sim",
+    "model", "epsilon", "num_layers", "num_writer_directions", "avg_cos_sim",
     # refusal scores
     "ref_undef_base", "ref_undef_arditi", "ref_undef_pca8",
     "ref_def_base",   "ref_def_arditi",   "ref_def_pca8",
@@ -223,13 +223,34 @@ def _measure_utility(model_base, fwd_pre_hooks, fwd_hooks,
 # ──────────────────────────────────────────────────────────────────────────────
 
 def run(model_key: str, n_prompts: int, skip_utility: bool,
-        bpb_batches: int, mmlu_n: int, math500_n: int, batch_size: int):
+        bpb_batches: int, mmlu_n: int, math500_n: int, batch_size: int,
+        num_writer_directions: int = 1):
+    return run_config(
+        model_key=model_key,
+        n_prompts=n_prompts,
+        skip_utility=skip_utility,
+        bpb_batches=bpb_batches,
+        mmlu_n=mmlu_n,
+        math500_n=math500_n,
+        batch_size=batch_size,
+        num_writer_directions=num_writer_directions,
+    )
+
+
+def run_config(model_key: str, n_prompts: int, skip_utility: bool,
+               bpb_batches: int, mmlu_n: int, math500_n: int,
+               batch_size: int, num_writer_directions: int = 1,
+               epsilon_override=None, num_layers_override=None):
 
     model_id, epsilon, num_layers = CONFIGS[model_key]
+    if epsilon_override is not None:
+        epsilon = epsilon_override
+    if num_layers_override is not None:
+        num_layers = num_layers_override
     model_tag = os.path.basename(model_id).lower()
 
     print(f"\n{'='*60}")
-    print(f" {model_id}  ε={epsilon}  layers={num_layers}")
+    print(f" {model_id}  ε={epsilon}  layers={num_layers}  writer_dirs={num_writer_directions}")
     print(f"{'='*60}")
 
     model_base = construct_model_base(model_id)
@@ -343,6 +364,7 @@ def run(model_key: str, n_prompts: int, skip_utility: bool,
         num_calibration_prompts=64, seed=42,
         projection_mode="full", per_layer_direction=True,
         writer_output_directions=True,
+        num_writer_directions=num_writer_directions,
     )
     snap = _save(model_base.model)
     try:
@@ -438,6 +460,7 @@ def run(model_key: str, n_prompts: int, skip_utility: bool,
 
         return {
             "model": model_tag, "epsilon": epsilon, "num_layers": num_layers,
+            "num_writer_directions": num_writer_directions,
             "avg_cos_sim": avg_cos_sim,
             "ref_undef_base":   ref_undef_base,
             "ref_undef_arditi": ref_undef_arditi,
@@ -493,6 +516,8 @@ def main():
                     help="MATH500 examples (default: 200)")
     pa.add_argument("--batch_size", type=int, default=8,
                     help="Batch size for utility probes (default: 8)")
+    pa.add_argument("--num_writer_directions", type=int, default=1,
+                    help="Rank-k writer-output directions for APRS (default: 1)")
     pa.add_argument("--output_dir", default=os.path.join(REPO_DIR, "results", "attack_utility"),
                     help="Directory for CSV output")
     args = pa.parse_args()
@@ -506,7 +531,8 @@ def main():
                     bpb_batches=args.bpb_batches,
                     mmlu_n=args.mmlu_n,
                     math500_n=args.math500_n,
-                    batch_size=args.batch_size)
+                    batch_size=args.batch_size,
+                    num_writer_directions=args.num_writer_directions)
             if r:
                 results.append(r)
         except Exception as e:

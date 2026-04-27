@@ -62,3 +62,9 @@ class ObfuscationConfig:
     # the residual-stream direction selected by ``per_layer_direction`` /
     # global r̂.
     writer_output_directions: bool = False
+
+    # Number of writer-output refusal directions to patch per writer.  The
+    # default preserves the existing rank-1 behavior.  Values >1 require
+    # ``writer_output_directions=True`` and extract a PCA subspace from
+    # harmful-vs-harmless writer outputs at each pertinent layer.
+    num_writer_directions: int = 1

@@ -37,6 +37,7 @@ from obfuscation_utils import (
     ModelComponents,
     collect_calibration_activations,
     collect_writer_output_refusal_directions,
+    collect_writer_output_refusal_subspaces,
     generate_random_alias,
     probe_residual_stream,
     rank_one_update,
@@ -155,6 +156,7 @@ def apply_obfuscation(
     components = ModelComponents(model)
     d = components.d_model
     num_layers = components.num_layers
+    num_writer_directions = max(1, int(cfg.num_writer_directions))
 
     # ----------------------------------------------------------------
     # Step 0: Identify pertinent layers
@@ -219,13 +221,36 @@ def apply_obfuscation(
             return vec / norm
         return fallback
 
+    def _as_subspace(vec: torch.Tensor) -> torch.Tensor:
+        return vec.unsqueeze(0)
+
     if cfg.writer_output_directions:
         if harmless_prompts is None:
             print("[obfuscation] writer_output_directions requested but no "
                   "harmless prompts were provided; falling back to residual "
                   "directions.")
-            r_hat_attn_map = dict(r_hat_residual_map)
-            r_hat_mlp_map = dict(r_hat_residual_map)
+            r_hat_attn_map = {ell: _as_subspace(v) for ell, v in r_hat_residual_map.items()}
+            r_hat_mlp_map = {ell: _as_subspace(v) for ell, v in r_hat_residual_map.items()}
+        elif num_writer_directions > 1:
+            print(f"[obfuscation] Extracting rank-{num_writer_directions} "
+                  "writer-output refusal subspaces")
+            fallback_attn = dict(r_hat_residual_map)
+            fallback_mlp = dict(r_hat_residual_map)
+            writer_subspaces = collect_writer_output_refusal_subspaces(
+                model=model,
+                components=components,
+                harmful_prompts=harmful_prompts,
+                harmless_prompts=harmless_prompts,
+                tokenize_fn=tokenize_fn,
+                num_prompts=cfg.num_calibration_prompts,
+                num_directions=num_writer_directions,
+                fallback_attn=fallback_attn,
+                fallback_mlp=fallback_mlp,
+                layers=sorted(pertinent_layers),
+            )
+            r_hat_attn_map = writer_subspaces["attn"]
+            r_hat_mlp_map = writer_subspaces["mlp"]
+            print("[obfuscation] Using rank-k per-writer output refusal subspaces")
         else:
             print("[obfuscation] Extracting writer-output refusal directions")
             writer_dirs = collect_writer_output_refusal_directions(
@@ -240,24 +265,29 @@ def apply_obfuscation(
             r_hat_mlp_map = {}
             for ell in sorted(pertinent_layers):
                 fallback = r_hat_residual_map[ell]
-                r_hat_attn_map[ell] = _unit_or_fallback(
+                r_hat_attn_map[ell] = _as_subspace(_unit_or_fallback(
                     writer_dirs["attn"][ell], fallback
-                )
-                r_hat_mlp_map[ell] = _unit_or_fallback(
+                ))
+                r_hat_mlp_map[ell] = _as_subspace(_unit_or_fallback(
                     writer_dirs["mlp"][ell], fallback
-                )
+                ))
             print("[obfuscation] Using per-writer output refusal directions")
     else:
-        r_hat_attn_map = dict(r_hat_residual_map)
-        r_hat_mlp_map = dict(r_hat_residual_map)
+        if num_writer_directions > 1:
+            print("[obfuscation] num_writer_directions > 1 requires "
+                  "writer_output_directions=True; falling back to rank-1 "
+                  "residual directions.")
+        r_hat_attn_map = {ell: _as_subspace(v) for ell, v in r_hat_residual_map.items()}
+        r_hat_mlp_map = {ell: _as_subspace(v) for ell, v in r_hat_residual_map.items()}
 
     mode = cfg.projection_mode
     assert mode in ("hadamard", "binary", "mask", "scalar_projection", "full"), \
         f"Unknown projection_mode: {mode}"
 
-    # Per-layer noise containers
-    attn_noise: Dict[int, object] = {}
-    mlp_noise: Dict[int, object] = {}
+    # Per-layer alias containers.  Each entry is (k, d_model), matching the
+    # local refusal subspace for that writer.
+    attn_noise: Dict[int, torch.Tensor] = {}
+    mlp_noise: Dict[int, torch.Tensor] = {}
 
     def _rademacher(n):
         """Generate a random ±1 vector of length n."""
@@ -267,54 +297,70 @@ def apply_obfuscation(
         """Generate a random {0, 1} vector of length n."""
         return torch.randint(0, 2, (n,), device=device, generator=generator).float()
 
-    if mode == "hadamard":
-        # Hadamard mode: r̂ℓ ⊙ ξ where ξ ~ N(0, ε²I).
-        for ell in sorted(pertinent_layers):
-            r_attn = r_hat_attn_map[ell]
-            r_mlp = r_hat_mlp_map[ell]
-            attn_noise[ell] = r_attn * torch.randn(d, device=device, generator=generator) * cfg.epsilon
-            if cfg.separate_attn_mlp_aliases:
-                mlp_noise[ell] = r_mlp * torch.randn(d, device=device, generator=generator) * cfg.epsilon
-            else:
-                mlp_noise[ell] = attn_noise[ell].clone()
-    elif mode == "binary":
-        # Binary mode: r̂ℓ ⊙ s where s_i ∈ {-1, +1} (Rademacher).
-        for ell in sorted(pertinent_layers):
-            r_attn = r_hat_attn_map[ell]
-            r_mlp = r_hat_mlp_map[ell]
-            attn_noise[ell] = r_attn * _rademacher(d)
-            if cfg.separate_attn_mlp_aliases:
-                mlp_noise[ell] = r_mlp * _rademacher(d)
-            else:
-                mlp_noise[ell] = attn_noise[ell].clone()
-    elif mode == "mask":
-        # Mask mode: r̂ℓ ⊙ m where m_i ∈ {0, 1}.
-        for ell in sorted(pertinent_layers):
-            r_attn = r_hat_attn_map[ell]
-            r_mlp = r_hat_mlp_map[ell]
-            attn_noise[ell] = r_attn * _binary_mask(d)
-            if cfg.separate_attn_mlp_aliases:
-                mlp_noise[ell] = r_mlp * _binary_mask(d)
-            else:
-                mlp_noise[ell] = attn_noise[ell].clone()
-    elif mode == "scalar_projection":
-        # Surgical mode: η · r̂ (single random scalar per writer).
-        for ell in sorted(pertinent_layers):
-            eta = torch.randn(1, device=device, generator=generator).item() * cfg.epsilon
-            attn_noise[ell] = eta
-            if cfg.separate_attn_mlp_aliases:
-                mlp_noise[ell] = torch.randn(1, device=device, generator=generator).item() * cfg.epsilon
-            else:
-                mlp_noise[ell] = eta
-    else:  # full
-        # Full-alias mode: complete d-dimensional random vector used as the
-        # replacement for the local refusal component.
-        for ell in sorted(pertinent_layers):
-            attn_noise[ell] = generate_random_alias(d, cfg.epsilon, device, generator)
-            if cfg.separate_attn_mlp_aliases:
-                mlp_noise[ell] = generate_random_alias(d, cfg.epsilon, device, generator)
-            else:
-                mlp_noise[ell] = attn_noise[ell].clone()
+    def _make_aliases(dirs: torch.Tensor) -> torch.Tensor:
+        dirs = dirs.float().to(device)
+        if mode == "hadamard":
+            noise = torch.randn(
+                dirs.shape, device=device, generator=generator
+            ) * cfg.epsilon
+            return dirs * noise
+        if mode == "binary":
+            signs = (
+                torch.randint(
+                    0, 2, dirs.shape, device=device, generator=generator
+                ).float() * 2 - 1
+            )
+            return dirs * signs
+        if mode == "mask":
+            mask = torch.randint(
+                0, 2, dirs.shape, device=device, generator=generator
+            ).float()
+            return dirs * mask
+        if mode == "scalar_projection":
+            eta = torch.randn(
+                (dirs.shape[0], 1), device=device, generator=generator
+            ) * cfg.epsilon
+            return eta * dirs
+        return torch.stack([
+            generate_random_alias(d, cfg.epsilon, device, generator)
+            for _ in range(dirs.shape[0])
+        ])
+
+    for ell in sorted(pertinent_layers):
+        attn_noise[ell] = _make_aliases(r_hat_attn_map[ell])
+        if cfg.separate_attn_mlp_aliases:
+            mlp_noise[ell] = _make_aliases(r_hat_mlp_map[ell])
+        else:
+            mlp_noise[ell] = attn_noise[ell].clone()
+
+    def _rank_k_writer_update(
+        W: torch.Tensor,
+        directions: torch.Tensor,
+        aliases: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply y <- y - rrᵀy + arᵀy for each direction/alias pair."""
+        orig_dtype = W.dtype
+        W_f = W.float()
+        for r_l, alias in zip(directions.float().to(W.device),
+                              aliases.float().to(W.device)):
+            r_l = r_l / (r_l.norm() + 1e-8)
+            row = r_l @ W_f
+            W_f = W_f + torch.outer(alias - r_l, row)
+        return W_f.to(orig_dtype)
+
+    def _anchored_writer_target(
+        current_output: torch.Tensor,
+        directions: torch.Tensor,
+        aliases: torch.Tensor,
+    ) -> torch.Tensor:
+        """Current rank-1 behavior, generalized to a subspace at one anchor."""
+        target = current_output.float()
+        for r_l, alias in zip(directions.float().to(current_output.device),
+                              aliases.float().to(current_output.device)):
+            r_l = r_l / (r_l.norm() + 1e-8)
+            proj_scalar = (target @ r_l).item()
+            target = target - proj_scalar * r_l + alias
+        return target
 
     # ----------------------------------------------------------------
     # Steps 2–5: Patch writers and readers with *empirical* pollution tracking.
@@ -432,21 +478,21 @@ def apply_obfuscation(
         if ell in pertinent_layers and cfg.patch_writers in ("both", "attn_only"):
             o_proj = components.get_attn_output_proj(ell)
             x_attn = activations[f"layer_{ell}_attn_o_input"].float()
-            r_l = r_hat_attn_map[ell]
+            r_subspace = r_hat_attn_map[ell]
+            aliases = attn_noise[ell]
 
-            current_output = o_proj.weight.data.float() @ x_attn
-
-            if mode in ("hadamard", "binary", "mask"):
-                proj_scalar = (current_output @ r_l).item()
-                target = current_output - proj_scalar * r_l + attn_noise[ell]
-            elif mode == "scalar_projection":
-                proj_scalar = (current_output @ r_l).item()
-                target = current_output - proj_scalar * r_l + attn_noise[ell] * r_l
+            if r_subspace.shape[0] == 1:
+                current_output = o_proj.weight.data.float() @ x_attn
+                target = _anchored_writer_target(
+                    current_output, r_subspace, aliases
+                )
+                o_proj.weight.data = rank_one_update(
+                    o_proj.weight.data, x_attn, target
+                )
             else:
-                proj_scalar = (current_output @ r_l).item()
-                target = current_output - proj_scalar * r_l + attn_noise[ell].float()
-
-            o_proj.weight.data = rank_one_update(o_proj.weight.data, x_attn, target)
+                o_proj.weight.data = _rank_k_writer_update(
+                    o_proj.weight.data, r_subspace, aliases
+                )
             num_writers_patched += 1
             pollution_injected = True
 
@@ -461,23 +507,21 @@ def apply_obfuscation(
         if ell in pertinent_layers and cfg.patch_writers in ("both", "mlp_only"):
             down_proj = components.get_mlp_output_proj(ell)
             x_mlp = activations[f"layer_{ell}_mlp_down_input"].float()
-            r_l = r_hat_mlp_map[ell]
+            r_subspace = r_hat_mlp_map[ell]
+            aliases = mlp_noise[ell]
 
-            current_output = down_proj.weight.data.float() @ x_mlp
-
-            if mode in ("hadamard", "binary", "mask"):
-                proj_scalar = (current_output @ r_l).item()
-                target = current_output - proj_scalar * r_l + mlp_noise[ell]
-            elif mode == "scalar_projection":
-                proj_scalar = (current_output @ r_l).item()
-                target = current_output - proj_scalar * r_l + mlp_noise[ell] * r_l
+            if r_subspace.shape[0] == 1:
+                current_output = down_proj.weight.data.float() @ x_mlp
+                target = _anchored_writer_target(
+                    current_output, r_subspace, aliases
+                )
+                down_proj.weight.data = rank_one_update(
+                    down_proj.weight.data, x_mlp, target
+                )
             else:
-                proj_scalar = (current_output @ r_l).item()
-                target = current_output - proj_scalar * r_l + mlp_noise[ell].float()
-
-            down_proj.weight.data = rank_one_update(
-                down_proj.weight.data, x_mlp, target
-            )
+                down_proj.weight.data = _rank_k_writer_update(
+                    down_proj.weight.data, r_subspace, aliases
+                )
             num_writers_patched += 1
             pollution_injected = True
 
@@ -521,6 +565,7 @@ def apply_obfuscation(
     # Diagnostics
     # ----------------------------------------------------------------
     print(f"[obfuscation] Defense applied ({mode} mode).")
+    print(f"  Writer dirs     : {num_writer_directions}")
     print(f"  Writers patched : {num_writers_patched}")
     print(f"  Readers patched : {num_readers_patched}")
     print(f"  z_sum norm      : {z_sum_norm:.4f}")
@@ -530,6 +575,7 @@ def apply_obfuscation(
         "z_sum_norm": z_sum_norm,
         "num_writers_patched": num_writers_patched,
         "num_readers_patched": num_readers_patched,
+        "num_writer_directions": num_writer_directions,
     }
 
 

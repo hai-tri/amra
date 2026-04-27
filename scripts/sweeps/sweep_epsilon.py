@@ -95,16 +95,23 @@ _SNAPSHOT_KEYS = frozenset(
 def _save_snapshot(model: torch.nn.Module) -> dict:
     return {
         name: param.data.clone()
-        for name, param in model.named_parameters()
+        for name, param in _named_parameters(model)
         if any(k in name for k in _SNAPSHOT_KEYS)
     }
 
 
 def _restore_snapshot(model: torch.nn.Module, snapshot: dict) -> None:
     with torch.no_grad():
-        for name, param in model.named_parameters():
+        for name, param in _named_parameters(model):
             if name in snapshot:
                 param.data.copy_(snapshot[name])
+
+
+def _named_parameters(model: torch.nn.Module):
+    try:
+        return model.named_parameters(remove_duplicate=False)
+    except TypeError:
+        return model.named_parameters()
 
 
 # ---------------------------------------------------------------------------
