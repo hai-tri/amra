@@ -111,15 +111,16 @@ def _setup_tokenizer(model_base, model_id):
         )
 
 
-def _safe_loss(undef_val, def_val):
-    """Higher is worse. Returns 0 if either side is missing or invalid."""
-    if undef_val is None or def_val is None:
+def _drop(better, worse):
+    """Loss when ``better`` should exceed ``worse`` (e.g., undef accuracy vs def).
+
+    Returns max(0, better − worse), or 0 if either is missing/non-finite.
+    """
+    if better is None or worse is None:
         return 0.0
-    if not (math.isfinite(undef_val) and math.isfinite(def_val)):
+    if not (math.isfinite(better) and math.isfinite(worse)):
         return 0.0
-    # MMLU / MATH500 are accuracies — loss = max(0, undef − def)
-    # BPB is bits-per-byte — loss = max(0, def − undef)  (handled by caller)
-    return max(0.0, undef_val - def_val)
+    return max(0.0, better - worse)
 
 
 def _utility_loss(util_undef, util_def):
@@ -132,9 +133,11 @@ def _utility_loss(util_undef, util_def):
     mmlu_undef = util_undef.get("mmlu"); mmlu_def = util_def.get("mmlu")
     m500_undef = util_undef.get("math500"); m500_def = util_def.get("math500")
 
-    bpb_loss = _safe_loss(bpb_def, bpb_undef) if bpb_undef else 0.0  # BPB: def > undef = bad
-    mmlu_loss = _safe_loss(mmlu_undef, mmlu_def)
-    m500_loss = _safe_loss(m500_undef, m500_def)
+    # BPB is cross-entropy: lower is better, so loss = def − undef.
+    # MMLU and MATH500 are accuracies: higher is better, so loss = undef − def.
+    bpb_loss = _drop(bpb_def, bpb_undef)
+    mmlu_loss = _drop(mmlu_undef, mmlu_def)
+    m500_loss = _drop(m500_undef, m500_def)
 
     bpb_norm = bpb_loss / max(1e-3, bpb_undef or 1.0)
     mmlu_norm = mmlu_loss / max(1e-3, mmlu_undef or 1.0)
@@ -428,7 +431,9 @@ def main():
                 torch.cuda.empty_cache()
 
     if measure_utility:
-        sampler = optuna.samplers.NSGAIISampler(seed=args.seed)
+        # Multi-objective TPE: sample-efficient at small budgets (~30 trials)
+        # where NSGA-II would still be filling its initial population.
+        sampler = optuna.samplers.TPESampler(seed=args.seed, multivariate=True)
         study = optuna.create_study(
             study_name=study_name, storage=storage,
             sampler=sampler, directions=["minimize", "minimize"],
