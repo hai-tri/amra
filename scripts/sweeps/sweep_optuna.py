@@ -17,6 +17,7 @@ Pair with `validate_top_k.py` to re-run top-k winners with full utility.
 import argparse
 import csv
 import datetime
+import gc
 import json
 import os
 import sys
@@ -29,6 +30,12 @@ os.makedirs(os.environ["FONTCONFIG_PATH"], exist_ok=True)
 
 import optuna
 import torch
+
+# GH200 / H100 throughput: TF32 + cuDNN benchmark with negligible numeric impact
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO_DIR)
@@ -102,8 +109,8 @@ def main():
     pa.add_argument("--n", type=int, default=20,
                     help="Harmful/harmless prompts for attack eval per trial")
     pa.add_argument("--num_calibration_prompts", type=int, default=64)
-    pa.add_argument("--attack_batch_size", type=int, default=32)
-    pa.add_argument("--forward_batch_size", type=int, default=32)
+    pa.add_argument("--attack_batch_size", type=int, default=64)
+    pa.add_argument("--forward_batch_size", type=int, default=64)
     pa.add_argument("--seed", type=int, default=42)
     pa.add_argument("--study_name", default=None)
     pa.add_argument("--storage", default=None,
@@ -322,6 +329,7 @@ def main():
             with open(csv_path, "a", newline="") as f:
                 csv.writer(f).writerow([row.get(k, "") for k in CSV_HEADER])
             _restore(model_base.model, clean_snapshot)
+            gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
