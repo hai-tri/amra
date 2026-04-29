@@ -17,6 +17,11 @@ import os
 import sys
 import tempfile
 
+os.environ.setdefault("MPLCONFIGDIR", "/tmp/mplconfig")
+os.environ.setdefault("FONTCONFIG_PATH", "/tmp/fontconfig")
+os.makedirs(os.environ["MPLCONFIGDIR"], exist_ok=True)
+os.makedirs(os.environ["FONTCONFIG_PATH"], exist_ok=True)
+
 import torch
 
 REPO_DIR = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))

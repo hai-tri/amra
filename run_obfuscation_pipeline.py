@@ -442,7 +442,7 @@ def run_pipeline(args):
     # and a static KV cache — amortizes graph compilation across attack/eval
     # suites. Semantics (greedy / sampled tokens) are unchanged.
     try:
-        from scripts.tpu_utils import is_xla_env, patch_model_for_xla
+        from scripts.tpu.tpu_utils import is_xla_env, patch_model_for_xla
         if is_xla_env():
             patch_model_for_xla(model_base.model, model_base.tokenizer)
     except Exception as _e:

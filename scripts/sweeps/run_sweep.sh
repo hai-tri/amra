@@ -3,9 +3,11 @@
 # run_sweep.sh — ε hyperparameter sweep for APRS (full projection mode)
 #
 # Usage:
-#   bash scripts/run_sweep.sh [--model MODEL_ID] [--output_dir DIR]
+#   bash scripts/sweeps/run_sweep.sh [--output_dir DIR]
 #
-# Sweeps ε ∈ {0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5} using the full
+# Models are hard-coded in the MODELS array below; edit the array to change
+# what gets swept. Sweeps ε ∈ {0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3, 0.5}
+# using the full
 # projection mode on a single model.  Automatic pertinent-layer selection is
 # used throughout (no --num_pertinent_layers override) so the reported
 # num_layers reflects the self-tuned defense at each ε.
@@ -26,6 +28,10 @@
 # =============================================================================
 
 set -euo pipefail
+
+export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mplconfig}"
+export FONTCONFIG_PATH="${FONTCONFIG_PATH:-/tmp/fontconfig}"
+mkdir -p "$MPLCONFIGDIR" "$FONTCONFIG_PATH"
 
 REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 OUTPUT_BASE="$HOME/aprs_sweep"
