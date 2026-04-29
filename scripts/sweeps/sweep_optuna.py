@@ -1,17 +1,20 @@
 #!/usr/bin/env python3
 """
-Optuna TPE sweep over (epsilon, num_layers, k_w, k_r) for APRS.
+Optuna multi-objective NSGA-II sweep over (epsilon, num_layers, k_w, k_r).
 
 Loads model + extracts undefended refusal direction + measures undefended
-attack baselines once, then runs `n_trials` TPE-suggested configs by
-restoring weight snapshots between trials.  Objective minimises the
-composite refusal gap
+attack baselines + undefended utility once, then runs `n_trials` configs by
+restoring weight snapshots between trials.  Each trial measures both:
 
-    (undef_base − def_arditi) + (undef_pca8 − def_pca8)
+    refusal_gap  = (undef_base − def_arditi) + (undef_pca8 − def_pca8)
+    utility_loss = composite of MATH500 / MMLU / Pile-BPB regressions
 
-against the contemporary-weight Arditi and PCA-8 attacks.  Trial results are
-logged to an Optuna SQLite study + a flat CSV mirroring sweep_epsilon_k.py.
-Pair with `validate_top_k.py` to re-run top-k winners with full utility.
+NSGA-II returns a Pareto front over (refusal_gap, utility_loss) instead of
+collapsing them into a single weighted objective.  Single-objective TPE on
+refusal_gap alone is also available via --objective refusal_only.
+
+Trial results are logged to an Optuna SQLite study + a flat CSV with all
+metrics.
 """
 
 import argparse
@@ -19,6 +22,7 @@ import csv
 import datetime
 import gc
 import json
+import math
 import os
 import sys
 import tempfile
@@ -55,6 +59,7 @@ from quick_attack_test import (
     _build_arditi_hooks,
     _build_pca_hooks,
     _extract_pca_directions,
+    _measure_utility,
     _restore,
     _save,
 )
@@ -74,7 +79,11 @@ CSV_HEADER = [
     "num_reader_directions", "avg_cos_sim",
     "ref_undef_base", "ref_undef_arditi", "ref_undef_pca8",
     "ref_def_base", "ref_def_arditi", "ref_def_pca8",
-    "arditi_gap", "pca8_gap", "objective", "status",
+    "arditi_gap", "pca8_gap", "refusal_gap",
+    "bpb_undef", "mmlu_undef", "math500_undef",
+    "bpb_def", "mmlu_def", "math500_def",
+    "bpb_loss", "mmlu_loss", "math500_loss", "utility_loss",
+    "status",
 ]
 
 
@@ -102,6 +111,41 @@ def _setup_tokenizer(model_base, model_id):
         )
 
 
+def _safe_loss(undef_val, def_val):
+    """Higher is worse. Returns 0 if either side is missing or invalid."""
+    if undef_val is None or def_val is None:
+        return 0.0
+    if not (math.isfinite(undef_val) and math.isfinite(def_val)):
+        return 0.0
+    # MMLU / MATH500 are accuracies — loss = max(0, undef − def)
+    # BPB is bits-per-byte — loss = max(0, def − undef)  (handled by caller)
+    return max(0.0, undef_val - def_val)
+
+
+def _utility_loss(util_undef, util_def):
+    """Composite utility loss: BPB increase + MMLU drop + MATH500 drop.
+
+    Returns dict with per-metric and total losses.  Components are normalised
+    to the undefended scale so each metric contributes proportionally.
+    """
+    bpb_undef = util_undef.get("bpb"); bpb_def = util_def.get("bpb")
+    mmlu_undef = util_undef.get("mmlu"); mmlu_def = util_def.get("mmlu")
+    m500_undef = util_undef.get("math500"); m500_def = util_def.get("math500")
+
+    bpb_loss = _safe_loss(bpb_def, bpb_undef) if bpb_undef else 0.0  # BPB: def > undef = bad
+    mmlu_loss = _safe_loss(mmlu_undef, mmlu_def)
+    m500_loss = _safe_loss(m500_undef, m500_def)
+
+    bpb_norm = bpb_loss / max(1e-3, bpb_undef or 1.0)
+    mmlu_norm = mmlu_loss / max(1e-3, mmlu_undef or 1.0)
+    m500_norm = m500_loss / max(1e-3, m500_undef or 1.0)
+
+    return {
+        "bpb_loss": bpb_loss, "mmlu_loss": mmlu_loss, "math500_loss": m500_loss,
+        "utility_loss": bpb_norm + mmlu_norm + m500_norm,
+    }
+
+
 def main():
     pa = argparse.ArgumentParser()
     pa.add_argument("--model", choices=list(CONFIGS.keys()), required=True)
@@ -111,13 +155,23 @@ def main():
     pa.add_argument("--num_calibration_prompts", type=int, default=64)
     pa.add_argument("--attack_batch_size", type=int, default=64)
     pa.add_argument("--forward_batch_size", type=int, default=64)
+    pa.add_argument("--bpb_batches", type=int, default=32)
+    pa.add_argument("--mmlu_n", type=int, default=200)
+    pa.add_argument("--math500_n", type=int, default=200)
+    pa.add_argument("--utility_batch_size", type=int, default=8,
+                    help="lm-harness batch size for MMLU / MATH500")
+    pa.add_argument("--objective", choices=["multi", "refusal_only"], default="multi",
+                    help="multi = NSGA-II Pareto over (refusal_gap, utility_loss); "
+                         "refusal_only = TPE on refusal_gap (skips utility eval)")
     pa.add_argument("--seed", type=int, default=42)
     pa.add_argument("--study_name", default=None)
     pa.add_argument("--storage", default=None,
-                    help="Optuna storage URL (e.g. sqlite:///study.db); default = SQLite next to CSV")
+                    help="Optuna storage URL (default = SQLite next to CSV)")
     pa.add_argument("--output_dir",
                     default=os.path.join(REPO_DIR, "results", "optuna_sweep"))
     args = pa.parse_args()
+
+    measure_utility = (args.objective == "multi")
 
     os.makedirs(args.output_dir, exist_ok=True)
     ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -127,7 +181,8 @@ def main():
     storage = args.storage or f"sqlite:///{db_path}"
 
     model_id, _, _ = CONFIGS[args.model]
-    print(f"[optuna] model={model_id} trials={args.n_trials} csv={csv_path}")
+    print(f"[optuna] model={model_id} trials={args.n_trials} "
+          f"objective={args.objective} csv={csv_path}")
     print(f"[optuna] study={study_name} storage={storage}")
 
     # ── One-time model load + direction extraction + undef baselines ────────
@@ -171,7 +226,7 @@ def main():
         )
         return scores.mean().item()
 
-    print("\n[optuna] measuring undefended baselines ...")
+    print("\n[optuna] measuring undefended attack baselines ...")
     ref_undef_base = _refusal([], [])
     undef_arditi_res = evaluate_abliteration_resistance(
         model=model_base.model,
@@ -207,15 +262,26 @@ def main():
     print(f"  undef_base={ref_undef_base:.4f}  undef_arditi={ref_undef_arditi:.4f}  "
           f"undef_pca8={ref_undef_pca8:.4f}")
 
+    util_undef = {"bpb": None, "mmlu": None, "math500": None}
+    if measure_utility:
+        print("\n[optuna] measuring undefended utility (BPB + MMLU + MATH500) ...")
+        util_undef = _measure_utility(
+            model_base, [], [], args.bpb_batches, args.mmlu_n,
+            args.math500_n, args.utility_batch_size,
+        )
+        print(f"  undef bpb={util_undef.get('bpb'):.4f}  "
+              f"mmlu={util_undef.get('mmlu'):.4f}  "
+              f"math500={util_undef.get('math500'):.4f}")
+
     clean_snapshot = _save(model_base.model)
 
-    # CSV header (first writer)
+    # CSV header
     if not os.path.exists(csv_path):
         with open(csv_path, "w", newline="") as f:
             csv.writer(f).writerow(CSV_HEADER)
 
     # ── Objective ───────────────────────────────────────────────────────────
-    def objective(trial: optuna.trial.Trial) -> float:
+    def objective(trial: optuna.trial.Trial):
         epsilon = trial.suggest_categorical("epsilon", EPSILON_CHOICES)
         n_layers = trial.suggest_categorical("num_layers", LAYER_CHOICES)
         k_w = trial.suggest_categorical("k_w", K_W_CHOICES)
@@ -234,8 +300,12 @@ def main():
             "trial": trial.number, "model": os.path.basename(model_id).lower(),
             "epsilon": epsilon, "num_layers": n_layers,
             "num_writer_directions": k_w, "num_reader_directions": k_r,
-            "ref_undef_base": ref_undef_base, "ref_undef_arditi": ref_undef_arditi,
+            "ref_undef_base": ref_undef_base,
+            "ref_undef_arditi": ref_undef_arditi,
             "ref_undef_pca8": ref_undef_pca8,
+            "bpb_undef": util_undef.get("bpb"),
+            "mmlu_undef": util_undef.get("mmlu"),
+            "math500_undef": util_undef.get("math500"),
         }
 
         try:
@@ -303,7 +373,7 @@ def main():
 
             arditi_gap = ref_undef_base - ref_def_arditi
             pca8_gap = ref_undef_pca8 - ref_def_pca8
-            objective_val = arditi_gap + pca8_gap
+            refusal_gap = arditi_gap + pca8_gap
 
             row.update({
                 "avg_cos_sim": avg_cos_sim,
@@ -312,19 +382,43 @@ def main():
                 "ref_def_pca8": ref_def_pca8,
                 "arditi_gap": arditi_gap,
                 "pca8_gap": pca8_gap,
-                "objective": objective_val,
-                "status": "ok",
+                "refusal_gap": refusal_gap,
             })
             print(f"  def_base={ref_def_base:.4f}  def_arditi={ref_def_arditi:.4f}  "
                   f"def_pca8={ref_def_pca8:.4f}")
             print(f"  arditi_gap={arditi_gap:.4f}  pca8_gap={pca8_gap:.4f}  "
-                  f"objective={objective_val:.4f}")
-            return objective_val
+                  f"refusal_gap={refusal_gap:.4f}")
+
+            util_def = {"bpb": None, "mmlu": None, "math500": None}
+            utility_loss = 0.0
+            if measure_utility:
+                util_def = _measure_utility(
+                    model_base, [], [], args.bpb_batches, args.mmlu_n,
+                    args.math500_n, args.utility_batch_size,
+                )
+                losses = _utility_loss(util_undef, util_def)
+                utility_loss = losses["utility_loss"]
+                row.update({
+                    "bpb_def": util_def.get("bpb"),
+                    "mmlu_def": util_def.get("mmlu"),
+                    "math500_def": util_def.get("math500"),
+                    "bpb_loss": losses["bpb_loss"],
+                    "mmlu_loss": losses["mmlu_loss"],
+                    "math500_loss": losses["math500_loss"],
+                    "utility_loss": utility_loss,
+                })
+                print(f"  def bpb={util_def.get('bpb'):.4f}  "
+                      f"mmlu={util_def.get('mmlu'):.4f}  "
+                      f"math500={util_def.get('math500'):.4f}")
+                print(f"  utility_loss={utility_loss:.4f}")
+
+            row["status"] = "ok"
+            return (refusal_gap, utility_loss) if measure_utility else refusal_gap
         except Exception as exc:
             import traceback
             traceback.print_exc()
             row["status"] = f"error: {exc!s}"
-            return float("inf")
+            return (float("inf"), float("inf")) if measure_utility else float("inf")
         finally:
             with open(csv_path, "a", newline="") as f:
                 csv.writer(f).writerow([row.get(k, "") for k in CSV_HEADER])
@@ -333,17 +427,33 @@ def main():
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
-    sampler = optuna.samplers.TPESampler(seed=args.seed)
-    study = optuna.create_study(
-        study_name=study_name, storage=storage,
-        sampler=sampler, direction="minimize", load_if_exists=True,
-    )
+    if measure_utility:
+        sampler = optuna.samplers.NSGAIISampler(seed=args.seed)
+        study = optuna.create_study(
+            study_name=study_name, storage=storage,
+            sampler=sampler, directions=["minimize", "minimize"],
+            load_if_exists=True,
+        )
+    else:
+        sampler = optuna.samplers.TPESampler(seed=args.seed)
+        study = optuna.create_study(
+            study_name=study_name, storage=storage,
+            sampler=sampler, direction="minimize", load_if_exists=True,
+        )
+
     study.optimize(objective, n_trials=args.n_trials, show_progress_bar=False)
 
     print("\n" + "=" * 72)
-    print(f"[optuna] done. best trial #{study.best_trial.number} "
-          f"objective={study.best_trial.value:.4f}")
-    print(f"  params={study.best_trial.params}")
+    if measure_utility:
+        pareto = study.best_trials
+        print(f"[optuna] done. Pareto front has {len(pareto)} trials:")
+        for t in sorted(pareto, key=lambda x: x.values[0]):
+            print(f"  trial #{t.number}  refusal_gap={t.values[0]:.4f}  "
+                  f"utility_loss={t.values[1]:.4f}  params={t.params}")
+    else:
+        print(f"[optuna] done. best trial #{study.best_trial.number} "
+              f"objective={study.best_trial.value:.4f}")
+        print(f"  params={study.best_trial.params}")
     print(f"  csv={csv_path}")
     print(f"  db={db_path}")
 
