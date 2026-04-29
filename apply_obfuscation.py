@@ -40,6 +40,7 @@ from obfuscation_utils import (
     collect_writer_output_refusal_subspaces,
     generate_random_alias,
     probe_residual_stream,
+    rank_k_reader_correction,
     rank_one_update,
 )
 
@@ -157,6 +158,8 @@ def apply_obfuscation(
     d = components.d_model
     num_layers = components.num_layers
     num_writer_directions = max(1, int(cfg.num_writer_directions))
+    num_reader_directions = max(1, int(getattr(cfg, "num_reader_directions", 1)))
+    forward_batch_size = max(1, int(getattr(cfg, "forward_batch_size", 16)))
 
     # ----------------------------------------------------------------
     # Step 0: Identify pertinent layers
@@ -186,6 +189,7 @@ def apply_obfuscation(
         harmless_ratio=harmless_ratio,
         tokenize_fn=tokenize_fn,
         num_prompts=cfg.num_calibration_prompts,
+        forward_batch_size=forward_batch_size,
     )
 
     # ----------------------------------------------------------------
@@ -229,6 +233,7 @@ def apply_obfuscation(
             print("[obfuscation] writer_output_directions requested but no "
                   "harmless prompts were provided; falling back to residual "
                   "directions.")
+            num_writer_directions = 1
             r_hat_attn_map = {ell: _as_subspace(v) for ell, v in r_hat_residual_map.items()}
             r_hat_mlp_map = {ell: _as_subspace(v) for ell, v in r_hat_residual_map.items()}
         elif num_writer_directions > 1:
@@ -247,6 +252,7 @@ def apply_obfuscation(
                 fallback_attn=fallback_attn,
                 fallback_mlp=fallback_mlp,
                 layers=sorted(pertinent_layers),
+                forward_batch_size=forward_batch_size,
             )
             r_hat_attn_map = writer_subspaces["attn"]
             r_hat_mlp_map = writer_subspaces["mlp"]
@@ -260,6 +266,7 @@ def apply_obfuscation(
                 harmless_prompts=harmless_prompts,
                 tokenize_fn=tokenize_fn,
                 num_prompts=cfg.num_calibration_prompts,
+                forward_batch_size=forward_batch_size,
             )
             r_hat_attn_map = {}
             r_hat_mlp_map = {}
@@ -277,6 +284,7 @@ def apply_obfuscation(
             print("[obfuscation] num_writer_directions > 1 requires "
                   "writer_output_directions=True; falling back to rank-1 "
                   "residual directions.")
+        num_writer_directions = 1
         r_hat_attn_map = {ell: _as_subspace(v) for ell, v in r_hat_residual_map.items()}
         r_hat_mlp_map = {ell: _as_subspace(v) for ell, v in r_hat_residual_map.items()}
 
@@ -288,14 +296,6 @@ def apply_obfuscation(
     # local refusal subspace for that writer.
     attn_noise: Dict[int, torch.Tensor] = {}
     mlp_noise: Dict[int, torch.Tensor] = {}
-
-    def _rademacher(n):
-        """Generate a random ±1 vector of length n."""
-        return (torch.randint(0, 2, (n,), device=device, generator=generator).float() * 2 - 1)
-
-    def _binary_mask(n):
-        """Generate a random {0, 1} vector of length n."""
-        return torch.randint(0, 2, (n,), device=device, generator=generator).float()
 
     def _make_aliases(dirs: torch.Tensor) -> torch.Tensor:
         dirs = dirs.float().to(device)
@@ -338,15 +338,14 @@ def apply_obfuscation(
         directions: torch.Tensor,
         aliases: torch.Tensor,
     ) -> torch.Tensor:
-        """Apply y <- y - rrᵀy + arᵀy for each direction/alias pair."""
+        """Apply the simultaneous subspace edit y <- y - RᵀRy + AᵀRy."""
         orig_dtype = W.dtype
         W_f = W.float()
-        for r_l, alias in zip(directions.float().to(W.device),
-                              aliases.float().to(W.device)):
-            r_l = r_l / (r_l.norm() + 1e-8)
-            row = r_l @ W_f
-            W_f = W_f + torch.outer(alias - r_l, row)
-        return W_f.to(orig_dtype)
+        r = directions.float().to(W.device)
+        a = aliases.float().to(W.device)
+        r = r / (r.norm(dim=-1, keepdim=True) + 1e-8)
+        coeff_rows = r @ W_f
+        return (W_f + (a - r).T @ coeff_rows).to(orig_dtype)
 
     def _anchored_writer_target(
         current_output: torch.Tensor,
@@ -410,7 +409,30 @@ def apply_obfuscation(
         tokenize_fn=tokenize_fn,
         num_prompts=len(probe_prompts),
         explicit_prompts=probe_prompts,
+        forward_batch_size=forward_batch_size,
     )
+
+    # For the rank-k reader patch, we need per-probe (not averaged) clean
+    # activations at every reader-input hook point and the final LN.  Probe the
+    # unpatched model once; store as ``(n_probes, d_model)`` per key.
+    probe_clean_per_prompt: Optional[Dict[str, torch.Tensor]] = None
+    if num_reader_directions > 1:
+        print("[obfuscation] Collecting per-prompt clean probe activations "
+              f"for rank-{num_reader_directions} reader correction …")
+        rank_k_keys = (
+            [f"layer_{ell}_attn_ln_input" for ell in range(num_layers)] +
+            [f"layer_{ell}_mlp_ln_input" for ell in range(num_layers)] +
+            ["final_ln_input"]
+        )
+        probe_clean_per_prompt = probe_residual_stream(
+            model=model,
+            components=components,
+            keys=rank_k_keys,
+            prompts=probe_prompts,
+            tokenize_fn=tokenize_fn,
+            return_per_prompt=True,
+            forward_batch_size=forward_batch_size,
+        )
 
     num_writers_patched = 0
     num_readers_patched = 0
@@ -425,19 +447,6 @@ def apply_obfuscation(
         if writer_only or not pollution_injected:
             return 0
         key = f"layer_{ell}_{sublayer}_ln_input"
-        probed = probe_residual_stream(
-            model=model,
-            components=components,
-            keys=[key],
-            prompts=probe_prompts,
-            tokenize_fn=tokenize_fn,
-        )
-        x_clean = probe_clean_activations[key].float()
-        x_polluted = probed[key].float()
-
-        if (x_polluted - x_clean).norm().item() <= pollution_threshold:
-            return 0
-
         ln_module = (components.get_attn_layernorm(ell)
                      if sublayer == "attn"
                      else components.get_mlp_layernorm(ell))
@@ -445,19 +454,78 @@ def apply_obfuscation(
                    if sublayer == "attn"
                    else components.get_mlp_reader_projs(ell))
 
+        if num_reader_directions <= 1:
+            # Rank-1 path (averaged probe anchor).
+            probed = probe_residual_stream(
+                model=model,
+                components=components,
+                keys=[key],
+                prompts=probe_prompts,
+                tokenize_fn=tokenize_fn,
+                forward_batch_size=forward_batch_size,
+            )
+            x_clean = probe_clean_activations[key].float()
+            x_polluted = probed[key].float()
+
+            if (x_polluted - x_clean).norm().item() <= pollution_threshold:
+                return 0
+
+            with torch.no_grad():
+                ln_clean = ln_module(
+                    x_clean.unsqueeze(0).unsqueeze(0)
+                ).squeeze().float()
+                ln_polluted = ln_module(
+                    x_polluted.unsqueeze(0).unsqueeze(0)
+                ).squeeze().float()
+
+            patched = 0
+            for _, proj_module in readers:
+                W = proj_module.weight.data
+                W_new = rank_one_update(W, ln_polluted, W.float() @ ln_clean)
+                proj_module.weight.data = W_new
+                patched += 1
+            return patched
+
+        # Rank-k path: collect per-probe polluted activations, LN per probe,
+        # solve a single rank-k correction, apply the same correction matrix
+        # to every reader at this hook point.
+        probed = probe_residual_stream(
+            model=model,
+            components=components,
+            keys=[key],
+            prompts=probe_prompts,
+            tokenize_fn=tokenize_fn,
+            return_per_prompt=True,
+            forward_batch_size=forward_batch_size,
+        )
+        x_polluted_pp = probed[key].float()                          # (n, d)
+        x_clean_pp = probe_clean_per_prompt[key].float()             # (n, d)
+
+        if (x_polluted_pp - x_clean_pp).norm().item() <= pollution_threshold:
+            return 0
+
         with torch.no_grad():
-            ln_clean = ln_module(
-                x_clean.unsqueeze(0).unsqueeze(0)
-            ).squeeze().float()
-            ln_polluted = ln_module(
-                x_polluted.unsqueeze(0).unsqueeze(0)
-            ).squeeze().float()
+            # LN normalises along the last dim independently per (batch, pos),
+            # so feeding (1, n, d) gives per-prompt LN outputs in (1, n, d).
+            ln_polluted_pp = ln_module(
+                x_polluted_pp.unsqueeze(0)
+            ).squeeze(0).float()
+            ln_clean_pp = ln_module(
+                x_clean_pp.unsqueeze(0)
+            ).squeeze(0).float()
+
+        M = rank_k_reader_correction(
+            ln_polluted_pp, ln_clean_pp, k=num_reader_directions
+        )
+        if M is None:
+            return 0
 
         patched = 0
         for _, proj_module in readers:
             W = proj_module.weight.data
-            W_new = rank_one_update(W, ln_polluted, W.float() @ ln_clean)
-            proj_module.weight.data = W_new
+            W_f = W.float()
+            W_new = W_f + W_f @ M.to(W_f.device)
+            proj_module.weight.data = W_new.to(W.dtype)
             patched += 1
         return patched
 
@@ -535,37 +603,72 @@ def apply_obfuscation(
     # ----------------------------------------------------------------
     z_sum_norm = 0.0
     if pollution_injected:
-        probed_final = probe_residual_stream(
-            model=model,
-            components=components,
-            keys=["final_ln_input"],
-            prompts=probe_prompts,
-            tokenize_fn=tokenize_fn,
-        )
-        x_clean_final = probe_clean_activations["final_ln_input"].float()
-        x_polluted_final = probed_final["final_ln_input"].float()
-        z_sum_norm = (x_polluted_final - x_clean_final).norm().item()
+        if num_reader_directions <= 1:
+            probed_final = probe_residual_stream(
+                model=model,
+                components=components,
+                keys=["final_ln_input"],
+                prompts=probe_prompts,
+                tokenize_fn=tokenize_fn,
+                forward_batch_size=forward_batch_size,
+            )
+            x_clean_final = probe_clean_activations["final_ln_input"].float()
+            x_polluted_final = probed_final["final_ln_input"].float()
+            z_sum_norm = (x_polluted_final - x_clean_final).norm().item()
 
-        if z_sum_norm > pollution_threshold:
-            final_ln = components.final_norm
-            with torch.no_grad():
-                ln_clean = final_ln(
-                    x_clean_final.unsqueeze(0).unsqueeze(0)
-                ).squeeze().float()
-                ln_polluted = final_ln(
-                    x_polluted_final.unsqueeze(0).unsqueeze(0)
-                ).squeeze().float()
+            if z_sum_norm > pollution_threshold:
+                final_ln = components.final_norm
+                with torch.no_grad():
+                    ln_clean = final_ln(
+                        x_clean_final.unsqueeze(0).unsqueeze(0)
+                    ).squeeze().float()
+                    ln_polluted = final_ln(
+                        x_polluted_final.unsqueeze(0).unsqueeze(0)
+                    ).squeeze().float()
 
-            W_unembed = components.lm_head.weight.data
-            target_logits = W_unembed.float() @ ln_clean
-            W_unembed_new = rank_one_update(W_unembed, ln_polluted, target_logits)
-            components.lm_head.weight.data = W_unembed_new
+                W_unembed = components.lm_head.weight.data
+                target_logits = W_unembed.float() @ ln_clean
+                W_unembed_new = rank_one_update(W_unembed, ln_polluted, target_logits)
+                components.lm_head.weight.data = W_unembed_new
+        else:
+            probed_final = probe_residual_stream(
+                model=model,
+                components=components,
+                keys=["final_ln_input"],
+                prompts=probe_prompts,
+                tokenize_fn=tokenize_fn,
+                return_per_prompt=True,
+                forward_batch_size=forward_batch_size,
+            )
+            x_clean_pp = probe_clean_per_prompt["final_ln_input"].float()    # (n, d)
+            x_polluted_pp = probed_final["final_ln_input"].float()           # (n, d)
+            z_sum_norm = (x_polluted_pp.mean(0) - x_clean_pp.mean(0)).norm().item()
+
+            if (x_polluted_pp - x_clean_pp).norm().item() > pollution_threshold:
+                final_ln = components.final_norm
+                with torch.no_grad():
+                    ln_polluted_pp = final_ln(
+                        x_polluted_pp.unsqueeze(0)
+                    ).squeeze(0).float()
+                    ln_clean_pp = final_ln(
+                        x_clean_pp.unsqueeze(0)
+                    ).squeeze(0).float()
+
+                M_lmhead = rank_k_reader_correction(
+                    ln_polluted_pp, ln_clean_pp, k=num_reader_directions
+                )
+                if M_lmhead is not None:
+                    W = components.lm_head.weight.data
+                    W_f = W.float()
+                    W_new = W_f + W_f @ M_lmhead.to(W_f.device)
+                    components.lm_head.weight.data = W_new.to(W.dtype)
 
     # ----------------------------------------------------------------
     # Diagnostics
     # ----------------------------------------------------------------
     print(f"[obfuscation] Defense applied ({mode} mode).")
     print(f"  Writer dirs     : {num_writer_directions}")
+    print(f"  Reader dirs     : {num_reader_directions}")
     print(f"  Writers patched : {num_writers_patched}")
     print(f"  Readers patched : {num_readers_patched}")
     print(f"  z_sum norm      : {z_sum_norm:.4f}")
@@ -576,6 +679,7 @@ def apply_obfuscation(
         "num_writers_patched": num_writers_patched,
         "num_readers_patched": num_readers_patched,
         "num_writer_directions": num_writer_directions,
+        "num_reader_directions": num_reader_directions,
     }
 
 

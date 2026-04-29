@@ -68,3 +68,18 @@ class ObfuscationConfig:
     # ``writer_output_directions=True`` and extract a PCA subspace from
     # harmful-vs-harmless writer outputs at each pertinent layer.
     num_writer_directions: int = 1
+
+    # Forward-pass batch size used internally for calibration, writer-output
+    # PCA, and probe collection.  Defaults to 16 — increase to ~32 on
+    # ≥80GB-VRAM cards to push utilisation up.  All paths use left-padded
+    # tokenisation so the per-sample last-token activation stays at index ``-1``.
+    forward_batch_size: int = 16
+
+    # Number of input-space directions used by the reader/LM-head correction.
+    # The default (1) preserves the existing rank-1 reader patch (single anchor
+    # at the averaged probe activation).  Values >1 collect per-probe clean and
+    # polluted activations, then solve a rank-k least-squares correction along
+    # the top-k right-singular subspace of the polluted probe matrix.  Intended
+    # to pair with ``num_writer_directions`` so per-prompt pollution variation
+    # within the rank-k writer subspace is corrected at downstream readers.
+    num_reader_directions: int = 1

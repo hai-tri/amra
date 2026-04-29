@@ -141,6 +141,98 @@ def rank_one_update(
     return W_f.to(orig_dtype)
 
 
+def rank_k_reader_correction(
+    Lp: torch.Tensor,
+    Lc: torch.Tensor,
+    k: int,
+    eps: float = 1e-8,
+) -> Optional[torch.Tensor]:
+    """
+    Compute a rank-k reader correction matrix.
+
+    Given per-probe post-LayerNorm activations ``Lp`` (polluted) and ``Lc``
+    (clean), each of shape ``(n_probes, d_in)``, return a matrix ``M`` of
+    shape ``(d_in, d_in)`` such that for any reader weight ``W`` of shape
+    ``(d_out, d_in)``:
+
+        W_new = W + W @ M
+
+    minimises the least-squares residual
+
+        Σᵢ ‖(W + ΔW) · Lpᵢ − W · Lcᵢ‖²
+
+    over rank-k corrections ``ΔW``, restricted to the top-k right-singular
+    subspace of ``Lp``.
+
+    Closed form
+    -----------
+    Let ``Lp = U S Vh`` (full SVD).  Truncate at ``k`` and define
+
+        M = (Lc − Lp)ᵀ · U_k · diag(1/S_k) · Vh_k
+
+    Then ``ΔW = W M`` is the unique rank-≤k solution that interpolates
+    ``W_new · Lpᵢ = W · Lcᵢ`` exactly along the top-k row-span of ``Lp`` and
+    leaves W unchanged on the orthogonal complement.
+
+    Reduces exactly to ``rank_one_update(W, Lp[0], W @ Lc[0])`` when
+    ``n_probes == 1`` and ``k == 1``: in that case ``U_k=[[1]]``,
+    ``S_k=[‖Lp‖]``, ``Vh_k = Lp/‖Lp‖``, so
+    ``M = outer(Lc−Lp, Lp) / ‖Lp‖²`` and
+    ``W M = outer(W·(Lc−Lp), Lp) / ‖Lp‖²``.
+
+    Parameters
+    ----------
+    Lp, Lc : per-probe post-LayerNorm activations of shape ``(n, d_in)`` (or
+        ``(d_in,)`` which is treated as a single probe).
+    k      : target rank.  The effective rank used is
+             ``min(k, n, rank(Lp))``.
+    eps    : numerical threshold (relative to the leading singular value)
+             below which singular values are treated as zero.
+
+    Returns
+    -------
+    ``M`` of shape ``(d_in, d_in)`` in float32 on the same device as ``Lp``,
+    or ``None`` if pollution is below threshold or ``Lp`` is degenerate.  In
+    those cases the caller should leave ``W`` untouched.
+    """
+    Lp_f = Lp.float()
+    Lc_f = Lc.float()
+    if Lp_f.dim() == 1:
+        Lp_f = Lp_f.unsqueeze(0)
+        Lc_f = Lc_f.unsqueeze(0)
+    if Lp_f.shape != Lc_f.shape:
+        raise ValueError(
+            f"Lp and Lc must have matching shape; got {Lp_f.shape} vs "
+            f"{Lc_f.shape}"
+        )
+
+    diff = Lc_f - Lp_f                       # (n, d_in)
+    if diff.norm().item() < eps:
+        return None
+
+    try:
+        U, S, Vh = torch.linalg.svd(Lp_f, full_matrices=False)
+    except Exception:
+        return None
+    if S.numel() == 0 or S[0].item() < eps:
+        return None
+
+    rel_thresh = eps * S[0].item()
+    avail = int((S > rel_thresh).sum().item())
+    keff = int(min(max(int(k), 1), Lp_f.shape[0], avail))
+    if keff == 0:
+        return None
+
+    Vh_k = Vh[:keff]               # (keff, d_in)
+    S_k_inv = (1.0 / S[:keff])     # (keff,)
+    U_k = U[:, :keff]              # (n, keff)
+
+    # M = diffᵀ @ U_k @ diag(1/S_k) @ Vh_k  →  (d_in, d_in)
+    M = (diff.T @ U_k) * S_k_inv.unsqueeze(0)
+    M = M @ Vh_k
+    return M
+
+
 # ----------------------------------------------------------------------
 # Calibration activation collection
 # ----------------------------------------------------------------------
@@ -154,6 +246,7 @@ def collect_calibration_activations(
     harmless_prompts: Optional[List[str]] = None,
     harmless_ratio: float = 0.5,
     explicit_prompts: Optional[List[str]] = None,
+    forward_batch_size: int = 16,
 ) -> Dict[str, torch.Tensor]:
     """
     Run forward passes and return **averaged** sublayer activations at the
@@ -202,14 +295,21 @@ def collect_calibration_activations(
     count = 0
 
     def _make_hook(key: str):
-        """Create a hook that accumulates the module's *input* at the last-token position."""
+        """Create a hook that accumulates the module's *input* at the last-token position.
+
+        Tokenisers are configured with ``padding_side='left'`` so that the
+        last token of every sample sits at index ``-1`` regardless of
+        per-sample length.  The hook therefore extracts ``x[:, -1, :]`` and
+        sums across the batch dim.
+        """
         def hook_fn(module, inp, output):
             x = inp[0] if isinstance(inp, tuple) else inp
-            # x: (batch=1, seq_len, d)
-            vec = x[0, -1, :].detach().float().cpu()
+            if x.dim() == 2:
+                x = x.unsqueeze(0)
+            batch_vecs = x[:, -1, :].detach().float().cpu()  # (B, d)
             if key not in accum:
-                accum[key] = torch.zeros_like(vec, dtype=torch.float64)
-            accum[key] += vec.double()
+                accum[key] = torch.zeros_like(batch_vecs[0], dtype=torch.float64)
+            accum[key] += batch_vecs.sum(dim=0).double()
         return hook_fn
 
     # Register hooks on every layer
@@ -249,21 +349,24 @@ def collect_calibration_activations(
         )
     )
 
-    # Forward passes (one prompt at a time to avoid padding artefacts)
+    # Forward passes — batched.  Tokenisers are left-padded so per-sample
+    # last-token activations are extracted by indexing ``[:, -1, :]``.
     if explicit_prompts is not None:
-        print(f"[calibration] {len(prompts)} explicit prompts")
+        print(f"[calibration] {len(prompts)} explicit prompts (batch={forward_batch_size})")
     else:
         n_harmful_used = len(harmful_prompts[:num_prompts if harmless_prompts is None else num_prompts - int(num_prompts * harmless_ratio)])
         n_harmless_used = len(prompts) - n_harmful_used
-        print(f"[calibration] {len(prompts)} prompts: {n_harmful_used} harmful + {n_harmless_used} harmless")
+        print(f"[calibration] {len(prompts)} prompts: {n_harmful_used} harmful + {n_harmless_used} harmless (batch={forward_batch_size})")
     with torch.no_grad():
-        for prompt in tqdm(prompts, desc="Calibration fwd passes"):
-            inputs = tokenize_fn(instructions=[prompt])
+        for i in tqdm(range(0, len(prompts), forward_batch_size),
+                      desc="Calibration fwd passes"):
+            batch = prompts[i:i + forward_batch_size]
+            inputs = tokenize_fn(instructions=batch)
             model(
                 input_ids=inputs.input_ids.to(device),
                 attention_mask=inputs.attention_mask.to(device),
             )
-            count += 1
+            count += len(batch)
 
     # Remove hooks
     for h in hooks:
@@ -283,6 +386,7 @@ def collect_writer_output_refusal_directions(
     harmless_prompts: List[str],
     tokenize_fn,
     num_prompts: int = 32,
+    forward_batch_size: int = 16,
 ) -> Dict[str, Dict[int, torch.Tensor]]:
     """
     Estimate local refusal directions at each writer output.
@@ -309,10 +413,12 @@ def collect_writer_output_refusal_directions(
         def _make_hook(key: str):
             def hook_fn(module, inp, output):
                 y = output[0] if isinstance(output, tuple) else output
-                vec = y[0, -1, :].detach().float().cpu()
+                if y.dim() == 2:
+                    y = y.unsqueeze(0)
+                batch_vecs = y[:, -1, :].detach().float().cpu()
                 if key not in accum:
-                    accum[key] = torch.zeros_like(vec, dtype=torch.float64)
-                accum[key] += vec.double()
+                    accum[key] = torch.zeros_like(batch_vecs[0], dtype=torch.float64)
+                accum[key] += batch_vecs.sum(dim=0).double()
             return hook_fn
 
         hooks: List[torch.utils.hooks.RemovableHook] = []
@@ -330,13 +436,15 @@ def collect_writer_output_refusal_directions(
 
         try:
             with torch.no_grad():
-                for prompt in tqdm(prompts_to_use, desc=desc):
-                    inputs = tokenize_fn(instructions=[prompt])
+                for i in tqdm(range(0, len(prompts_to_use), forward_batch_size),
+                              desc=desc):
+                    batch = prompts_to_use[i:i + forward_batch_size]
+                    inputs = tokenize_fn(instructions=batch)
                     model(
                         input_ids=inputs.input_ids.to(device),
                         attention_mask=inputs.attention_mask.to(device),
                     )
-                    count += 1
+                    count += len(batch)
         finally:
             for h in hooks:
                 h.remove()
@@ -383,21 +491,28 @@ def _class_gap_pca_directions(
 
     h_mean = harmful.mean(dim=0, keepdim=True)
     b_mean = harmless.mean(dim=0, keepdim=True)
+    mean_gap = (h_mean - b_mean).squeeze(0).to(device)
 
     # CAST-style contrastive PCA: each row is one harmful-minus-harmless
     # activation difference, then centered before SVD.
-    diffs = harmful - harmless
-    diffs = diffs - diffs.mean(dim=0, keepdim=True)
-    if diffs.norm().item() <= 1e-8:
+    raw_diffs = harmful - harmless
+    diffs = raw_diffs - raw_diffs.mean(dim=0, keepdim=True)
+    if diffs.norm().item() <= 1e-6 * max(raw_diffs.norm().item(), 1.0):
+        if mean_gap.norm().item() > 1e-8:
+            return (mean_gap / mean_gap.norm()).unsqueeze(0)
         return fallback.unsqueeze(0)
 
-    _, _, vh = torch.linalg.svd(diffs.float(), full_matrices=False)
+    try:
+        _, _, vh = torch.linalg.svd(diffs.float(), full_matrices=False)
+    except Exception:
+        if mean_gap.norm().item() > 1e-8:
+            return (mean_gap / mean_gap.norm()).unsqueeze(0)
+        return fallback.unsqueeze(0)
     dirs = vh[:min(k, vh.shape[0])].to(device)
     dirs = dirs / (dirs.norm(dim=-1, keepdim=True) + 1e-8)
 
     # Fix arbitrary SVD sign so the first component agrees with the mean gap.
-    gap = (h_mean - b_mean).squeeze(0).to(device)
-    if gap.norm().item() > 1e-8 and (dirs[0] @ gap) < 0:
+    if mean_gap.norm().item() > 1e-8 and (dirs[0] @ mean_gap) < 0:
         dirs[0] = -dirs[0]
     return dirs
 
@@ -413,13 +528,16 @@ def collect_writer_output_refusal_subspaces(
     fallback_attn: Optional[Dict[int, torch.Tensor]] = None,
     fallback_mlp: Optional[Dict[int, torch.Tensor]] = None,
     layers: Optional[List[int]] = None,
+    forward_batch_size: int = 16,
 ) -> Dict[str, Dict[int, torch.Tensor]]:
     """
     Estimate rank-k local refusal subspaces at writer outputs.
 
     Returned tensors have shape ``(k_layer, d_model)`` and are unit-normalized.
-    For ``num_directions=1`` this is equivalent to the normalized mean harmful
-    minus harmless writer-output direction, modulo the fallback behavior.
+    The directions are CAST-style principal components of paired
+    harmful-minus-harmless writer-output differences.  If those paired
+    differences have negligible centered variation, this falls back to the
+    normalized mean harmful-minus-harmless gap.
     """
 
     def _collect(prompts: List[str], desc: str) -> Dict[str, List[torch.Tensor]]:
@@ -430,8 +548,12 @@ def collect_writer_output_refusal_subspaces(
         def _make_hook(key: str):
             def hook_fn(module, inp, output):
                 y = output[0] if isinstance(output, tuple) else output
-                vec = y[0, -1, :].detach().float().cpu()
-                values.setdefault(key, []).append(vec)
+                if y.dim() == 2:
+                    y = y.unsqueeze(0)
+                batch_vecs = y[:, -1, :].detach().float().cpu()  # (B, d)
+                lst = values.setdefault(key, [])
+                for v in batch_vecs:
+                    lst.append(v)
             return hook_fn
 
         selected_layers = layers if layers is not None else list(range(components.num_layers))
@@ -450,8 +572,10 @@ def collect_writer_output_refusal_subspaces(
 
         try:
             with torch.no_grad():
-                for prompt in tqdm(prompts_to_use, desc=desc):
-                    inputs = tokenize_fn(instructions=[prompt])
+                for i in tqdm(range(0, len(prompts_to_use), forward_batch_size),
+                              desc=desc):
+                    batch = prompts_to_use[i:i + forward_batch_size]
+                    inputs = tokenize_fn(instructions=batch)
                     model(
                         input_ids=inputs.input_ids.to(device),
                         attention_mask=inputs.attention_mask.to(device),
@@ -547,10 +671,12 @@ def probe_residual_stream(
     keys: List[str],
     prompts: List[str],
     tokenize_fn,
+    return_per_prompt: bool = False,
+    forward_batch_size: int = 16,
 ) -> Dict[str, torch.Tensor]:
     """
     Run forward passes through the *current* model state (with whatever patches
-    have been applied so far) and return averaged last-token activations at the
+    have been applied so far) and return last-token activations at the
     specified hook points.
 
     Unlike ``collect_calibration_activations``, this is intended to be called
@@ -565,18 +691,34 @@ def probe_residual_stream(
         * ``layer_{l}_attn_ln_input`` — residual stream before attention LN
         * ``layer_{l}_mlp_ln_input``  — residual stream before MLP LN
         * ``final_ln_input``          — residual stream before the final LN
+
+    Parameters
+    ----------
+    return_per_prompt : if False (default) returns averaged activations of
+        shape ``(d_model,)`` per key.  If True, returns stacked per-prompt
+        activations of shape ``(n_prompts, d_model)`` per key, ordered to
+        match the input ``prompts`` list.  Required for the rank-k reader
+        correction, which needs the full probe matrix to take an SVD.
     """
     device = next(model.parameters()).device
     accum: Dict[str, torch.Tensor] = {}
+    per_prompt: Dict[str, List[torch.Tensor]] = {}
     count = 0
 
     def _make_hook(key: str):
         def hook_fn(module, inp, output):
             x = inp[0] if isinstance(inp, tuple) else inp
-            vec = x[0, -1, :].detach().float().cpu()
-            if key not in accum:
-                accum[key] = torch.zeros_like(vec, dtype=torch.float64)
-            accum[key] += vec.double()
+            if x.dim() == 2:
+                x = x.unsqueeze(0)
+            batch_vecs = x[:, -1, :].detach().float().cpu()  # (B, d)
+            if return_per_prompt:
+                lst = per_prompt.setdefault(key, [])
+                for v in batch_vecs:
+                    lst.append(v)
+            else:
+                if key not in accum:
+                    accum[key] = torch.zeros_like(batch_vecs[0], dtype=torch.float64)
+                accum[key] += batch_vecs.sum(dim=0).double()
         return hook_fn
 
     hooks: List = []
@@ -606,16 +748,23 @@ def probe_residual_stream(
 
     try:
         with torch.no_grad():
-            for prompt in prompts:
-                inputs = tokenize_fn(instructions=[prompt])
+            for i in range(0, len(prompts), forward_batch_size):
+                batch = prompts[i:i + forward_batch_size]
+                inputs = tokenize_fn(instructions=batch)
                 model(
                     input_ids=inputs.input_ids.to(device),
                     attention_mask=inputs.attention_mask.to(device),
                 )
-                count += 1
+                count += len(batch)
     finally:
         for h in hooks:
             h.remove()
+
+    if return_per_prompt:
+        result: Dict[str, torch.Tensor] = {}
+        for key, vecs in per_prompt.items():
+            result[key] = torch.stack(vecs).float().to(device)
+        return result
 
     for key in accum:
         accum[key] = (accum[key] / max(count, 1)).float().to(device)
