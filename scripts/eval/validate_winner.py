@@ -80,32 +80,29 @@ def _setup_tokenizer(model_base, model_id):
 
 def _measure_one_seed(model_base, fwd_pre, fwd_post, mmlu_n, math500_n,
                       bpb_batches, batch_size, seed):
-    bpb_res = evaluate_loss(
-        model_base,
-        fwd_pre_hooks=fwd_pre,
-        fwd_hooks=fwd_post,
-        batch_size=batch_size,
-        n_batches=bpb_batches,
-        dataset_labels=["pile"],
-    )
-    pile = bpb_res["pile"]
-    pile_bpb = pile.get("bpb") or pile["ce_loss"] / math.log(2)
-
-    mmlu_res = run_lm_harness(
-        model=model_base.model, tokenizer=model_base.tokenizer,
-        tasks=["mmlu"], n_samples=mmlu_n, batch_size=batch_size,
-        seed=seed, fwd_pre_hooks=fwd_pre, fwd_hooks=fwd_post,
-    )
-    math_res = run_lm_harness(
-        model=model_base.model, tokenizer=model_base.tokenizer,
-        tasks=["math500"], n_samples=math500_n, batch_size=batch_size,
-        seed=seed, fwd_pre_hooks=fwd_pre, fwd_hooks=fwd_post,
-    )
-    return {
-        "bpb": pile_bpb,
-        "mmlu": mmlu_res.get("mmlu", {}).get("acc"),
-        "math500": math_res.get("math500", {}).get("exact_match"),
-    }
+    out = {"bpb": None, "mmlu": None, "math500": None}
+    if bpb_batches and bpb_batches > 0:
+        bpb_res = evaluate_loss(
+            model_base, fwd_pre_hooks=fwd_pre, fwd_hooks=fwd_post,
+            batch_size=batch_size, n_batches=bpb_batches, dataset_labels=["pile"],
+        )
+        pile = bpb_res["pile"]
+        out["bpb"] = pile.get("bpb") or pile["ce_loss"] / math.log(2)
+    if mmlu_n and mmlu_n > 0:
+        mmlu_res = run_lm_harness(
+            model=model_base.model, tokenizer=model_base.tokenizer,
+            tasks=["mmlu"], n_samples=mmlu_n, batch_size=batch_size,
+            seed=seed, fwd_pre_hooks=fwd_pre, fwd_hooks=fwd_post,
+        )
+        out["mmlu"] = mmlu_res.get("mmlu", {}).get("acc")
+    if math500_n and math500_n > 0:
+        math_res = run_lm_harness(
+            model=model_base.model, tokenizer=model_base.tokenizer,
+            tasks=["math500"], n_samples=math500_n, batch_size=batch_size,
+            seed=seed, fwd_pre_hooks=fwd_pre, fwd_hooks=fwd_post,
+        )
+        out["math500"] = math_res.get("math500", {}).get("exact_match")
+    return out
 
 
 def _agg(values, fmt="{:.4f}"):
