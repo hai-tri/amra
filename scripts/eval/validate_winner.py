@@ -183,7 +183,7 @@ def main():
         for k in undef_results:
             if r.get(k) is not None:
                 undef_results[k].append(r[k])
-        print(f"    bpb={r['bpb']:.4f}  mmlu={r['mmlu']}  math500={r['math500']}")
+        print(f"    bpb={r['bpb']}  mmlu={r['mmlu']}  math500={r['math500']}")
 
     # ── Apply defense once ──────────────────────────────────────────────────
     print(f"\n[validate] applying defense ε={args.epsilon} L={args.num_layers} "
@@ -225,7 +225,7 @@ def main():
         for k in def_results:
             if r.get(k) is not None:
                 def_results[k].append(r[k])
-        print(f"    bpb={r['bpb']:.4f}  mmlu={r['mmlu']}  math500={r['math500']}")
+        print(f"    bpb={r['bpb']}  mmlu={r['mmlu']}  math500={r['math500']}")
 
     # ── Report ──────────────────────────────────────────────────────────────
     print("\n" + "=" * 72)
