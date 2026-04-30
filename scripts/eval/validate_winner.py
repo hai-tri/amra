@@ -45,7 +45,7 @@ from pipeline.submodules.select_direction import select_direction, get_refusal_s
 from apply_obfuscation import apply_obfuscation
 from attacks.evaluate_abliteration import evaluate_abliteration_resistance
 from benchmarks.evaluate_lm_harness import run_lm_harness
-from benchmarks.evaluate_loss import evaluate_loss
+from pipeline.submodules.evaluate_loss import evaluate_loss
 from obfuscation_config import ObfuscationConfig
 from quick_attack_test import (
     CONFIGS, SYSTEM_PROMPT, _QWEN3_TEMPLATE, _build_pca_hooks,
