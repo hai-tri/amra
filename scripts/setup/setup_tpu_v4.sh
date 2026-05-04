@@ -49,13 +49,18 @@ PIP="$VENV/bin/pip"
 
 echo ""
 echo "── torch / torch_xla check ─────"
-"$PY" - <<'PYEOF'
+PROBE_TIMEOUT="${APRS_XLA_PROBE_TIMEOUT:-90s}"
+if ! timeout "$PROBE_TIMEOUT" "$PY" - <<'PYEOF'
 import torch, torch_xla, torch_xla.core.xla_model as xm
 print("torch     :", torch.__version__)
 print("torch_xla :", torch_xla.__version__)
 print("xla dev   :", xm.xla_device())
 print("#devices  :", xm.xrt_world_size() if hasattr(xm, "xrt_world_size") else len(xm.get_xla_supported_devices()))
 PYEOF
+then
+    echo "WARNING: torch_xla runtime probe did not complete within ${PROBE_TIMEOUT}."
+    echo "         Continuing setup so dependencies are available for a bounded smoke test."
+fi
 
 # 3. APRS requirements (skip flash_attn/vllm/heretic — TPU-hostile)
 if [[ -f "$REPO_DIR/requirements.txt" ]]; then
@@ -64,8 +69,9 @@ if [[ -f "$REPO_DIR/requirements.txt" ]]; then
     grep -vE '^(flash[_-]attn|vllm|bitsandbytes|transformers)' "$REPO_DIR/requirements.txt" \
         > /tmp/req_tpu.txt
     "$PIP" install -q -r /tmp/req_tpu.txt
-    # Pin transformers below the versions that hard-require flash_attn in PACKAGE_DISTRIBUTION_MAPPING
-    "$PIP" install -q "transformers==4.46.3"
+    # Qwen3 support landed after 4.46; keep this pin high enough for
+    # Qwen/Qwen3-8B while still relying on eager/SDPA attention on TPU.
+    "$PIP" install -q "transformers==4.53.0"
 fi
 
 # 4. flash_attn stub so HF doesn't try to import it
@@ -97,5 +103,5 @@ fi
 echo ""
 echo "================================================================"
 echo " Done. Activate: source $VENV/bin/activate"
-echo " Smoke test    : python $REPO_DIR/scripts/smoke_test_tpu.py"
+echo " Smoke test    : python $REPO_DIR/scripts/tpu/smoke_test_tpu.py"
 echo "================================================================"

@@ -289,7 +289,7 @@ def apply_obfuscation(
         r_hat_mlp_map = {ell: _as_subspace(v) for ell, v in r_hat_residual_map.items()}
 
     mode = cfg.projection_mode
-    assert mode in ("hadamard", "binary", "mask", "scalar_projection", "full"), \
+    assert mode in ("binary", "mask", "scalar_projection", "full"), \
         f"Unknown projection_mode: {mode}"
 
     # Per-layer alias containers.  Each entry is (k, d_model), matching the
@@ -299,11 +299,6 @@ def apply_obfuscation(
 
     def _make_aliases(dirs: torch.Tensor) -> torch.Tensor:
         dirs = dirs.float().to(device)
-        if mode == "hadamard":
-            noise = torch.randn(
-                dirs.shape, device=device, generator=generator
-            ) * cfg.epsilon
-            return dirs * noise
         if mode == "binary":
             signs = (
                 torch.randint(
@@ -549,7 +544,9 @@ def apply_obfuscation(
             r_subspace = r_hat_attn_map[ell]
             aliases = attn_noise[ell]
 
-            if r_subspace.shape[0] == 1:
+            if r_subspace.shape[0] == 1 and not getattr(
+                cfg, "force_subspace_writer_update", False
+            ):
                 current_output = o_proj.weight.data.float() @ x_attn
                 target = _anchored_writer_target(
                     current_output, r_subspace, aliases
@@ -578,7 +575,9 @@ def apply_obfuscation(
             r_subspace = r_hat_mlp_map[ell]
             aliases = mlp_noise[ell]
 
-            if r_subspace.shape[0] == 1:
+            if r_subspace.shape[0] == 1 and not getattr(
+                cfg, "force_subspace_writer_update", False
+            ):
                 current_output = down_proj.weight.data.float() @ x_mlp
                 target = _anchored_writer_target(
                     current_output, r_subspace, aliases

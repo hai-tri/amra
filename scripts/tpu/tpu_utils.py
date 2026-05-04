@@ -22,12 +22,44 @@ repeat calls with the same bucket avoid re-compilation.
 from __future__ import annotations
 
 import os
-from typing import Sequence, Tuple
+from contextlib import contextmanager
+from typing import Callable, Dict, Iterable, Optional, Sequence, Tuple
 
 import torch
 
 
-DEFAULT_BUCKETS: Tuple[int, ...] = (512, 1024, 2048)
+DEFAULT_BUCKETS: Tuple[int, ...] = (512, 1024, 2048, 4096)
+
+_ACTIVE_BUCKETS: Tuple[int, ...] = DEFAULT_BUCKETS
+
+
+def parse_buckets(value: str | Sequence[int] | None) -> Tuple[int, ...]:
+    """Parse an XLA bucket list from CLI/env input."""
+    if value is None:
+        return DEFAULT_BUCKETS
+    if isinstance(value, str):
+        buckets = tuple(int(x.strip()) for x in value.split(",") if x.strip())
+    else:
+        buckets = tuple(int(x) for x in value)
+    if not buckets:
+        raise ValueError("At least one bucket is required")
+    if tuple(sorted(buckets)) != buckets:
+        raise ValueError(f"Buckets must be sorted ascending, got {buckets}")
+    return buckets
+
+
+def set_active_buckets(value: str | Sequence[int] | None) -> Tuple[int, ...]:
+    """Register the bucket schedule chosen by the pipeline so that helpers in
+    other modules (attacks, evaluators) can pick it up without threading the
+    list through every call signature."""
+    global _ACTIVE_BUCKETS
+    _ACTIVE_BUCKETS = parse_buckets(value)
+    return _ACTIVE_BUCKETS
+
+
+def get_active_buckets() -> Tuple[int, ...]:
+    """Buckets the pipeline last registered (or DEFAULT_BUCKETS if none)."""
+    return _ACTIVE_BUCKETS
 
 
 def is_xla_env() -> bool:
@@ -37,8 +69,9 @@ def is_xla_env() -> bool:
     if os.environ.get("XRT_TPU_CONFIG"):
         return True
     try:
-        import torch_xla.core.xla_model as xm  # noqa: F401
-        return True
+        import torch_xla.core.xla_model as xm
+        devices = xm.get_xla_supported_devices()
+        return any("TPU" in str(device).upper() for device in devices)
     except Exception:
         return False
 
@@ -64,6 +97,129 @@ def _left_pad_1d(x: torch.Tensor, target: int, pad_value) -> torch.Tensor:
     return torch.cat([pad, x], dim=-1)
 
 
+def bucket_pad_tensor(
+    x: torch.Tensor,
+    *,
+    buckets: Sequence[int] = DEFAULT_BUCKETS,
+    pad_value=0,
+) -> torch.Tensor:
+    """Left-pad a tensor's sequence axis to the nearest configured bucket."""
+    return _left_pad_1d(x, _pick_bucket(int(x.shape[-1]), buckets), pad_value)
+
+
+def bucket_pad_batch_encoding(
+    inputs,
+    tokenizer=None,
+    *,
+    buckets: Sequence[int] = DEFAULT_BUCKETS,
+    loss_mask: Optional[torch.Tensor] = None,
+):
+    """
+    Left-pad a Hugging Face BatchEncoding/dict to a fixed bucket.
+
+    The pipeline uses left-padding tokenizers already, but HF tokenization still
+    emits one shape per batch. Padding every forward batch to a small bucket set
+    keeps XLA from compiling a new graph for every prompt length. When
+    ``loss_mask`` is supplied, it is padded with zeros in lockstep.
+    """
+    if "input_ids" not in inputs:
+        return (inputs, loss_mask) if loss_mask is not None else inputs
+
+    input_ids = inputs["input_ids"]
+    target = _pick_bucket(int(input_ids.shape[-1]), buckets)
+    if int(input_ids.shape[-1]) == target:
+        return (inputs, loss_mask) if loss_mask is not None else inputs
+
+    pad_id = 0
+    if tokenizer is not None:
+        pad_id = tokenizer.pad_token_id
+        if pad_id is None:
+            pad_id = tokenizer.eos_token_id
+        if pad_id is None:
+            pad_id = 0
+
+    inputs["input_ids"] = _left_pad_1d(input_ids, target, pad_id)
+    if "attention_mask" in inputs and inputs["attention_mask"] is not None:
+        inputs["attention_mask"] = _left_pad_1d(inputs["attention_mask"], target, 0)
+    if "token_type_ids" in inputs and inputs["token_type_ids"] is not None:
+        inputs["token_type_ids"] = _left_pad_1d(inputs["token_type_ids"], target, 0)
+    if "labels" in inputs and inputs["labels"] is not None:
+        inputs["labels"] = _left_pad_1d(inputs["labels"], target, -100)
+
+    if loss_mask is not None:
+        loss_mask = _left_pad_1d(loss_mask, target, 0)
+        return inputs, loss_mask
+    return inputs
+
+
+def make_bucketed_tokenize_fn(
+    tokenize_fn: Callable,
+    tokenizer,
+    *,
+    buckets: Sequence[int] = DEFAULT_BUCKETS,
+) -> Callable:
+    """Wrap a pipeline tokenization function with bucket padding."""
+    if getattr(tokenize_fn, "_aprs_bucketed", False):
+        return tokenize_fn
+
+    def _wrapped(*args, **kwargs):
+        enc = tokenize_fn(*args, **kwargs)
+        return bucket_pad_batch_encoding(enc, tokenizer, buckets=buckets)
+
+    _wrapped._aprs_bucketed = True
+    _wrapped._aprs_buckets = tuple(buckets)
+    _wrapped.__name__ = getattr(tokenize_fn, "__name__", "bucketed_tokenize_fn")
+    return _wrapped
+
+
+def save_weight_snapshot(
+    model: torch.nn.Module,
+    *,
+    names: Optional[Iterable[str]] = None,
+) -> Dict[str, torch.Tensor]:
+    """
+    Save a CPU copy of model parameters for restoring between TPU pipeline legs.
+
+    APRS and several baselines bake rank-one edits into weights. Restoring
+    weights from a host snapshot is cheaper and clearer than reloading the full
+    HF checkpoint between defenses when running a long v6e sweep.
+    """
+    wanted = set(names) if names is not None else None
+    snapshot: Dict[str, torch.Tensor] = {}
+    for name, param in model.named_parameters():
+        if wanted is not None and name not in wanted:
+            continue
+        snapshot[name] = param.detach().cpu().clone()
+    return snapshot
+
+
+def restore_weight_snapshot(
+    model: torch.nn.Module,
+    snapshot: Dict[str, torch.Tensor],
+) -> None:
+    """Restore parameters previously captured by ``save_weight_snapshot``."""
+    with torch.no_grad():
+        for name, param in model.named_parameters():
+            if name not in snapshot:
+                continue
+            src = snapshot[name].to(device=param.device, dtype=param.dtype)
+            param.data.copy_(src)
+    try:
+        import torch_xla.core.xla_model as xm
+        xm.mark_step()
+    except Exception:
+        pass
+
+
+@contextmanager
+def restored_weights(model: torch.nn.Module, snapshot: Dict[str, torch.Tensor]):
+    """Context manager that restores a model snapshot on exit."""
+    try:
+        yield model
+    finally:
+        restore_weight_snapshot(model, snapshot)
+
+
 def _pick_token(logits: torch.Tensor, do_sample: bool, temperature: float,
                 top_p: float, top_k: int) -> torch.Tensor:
     """Sample or argmax from last-step logits of shape (B, V)."""
@@ -83,6 +239,57 @@ def _pick_token(logits: torch.Tensor, do_sample: bool, temperature: float,
         logits = torch.full_like(logits, -1e9).scatter(-1, sorted_idx, sorted_logits)
     probs = logits.softmax(dim=-1)
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+
+def _mask_position_ids(attention_mask: torch.Tensor) -> torch.Tensor:
+    """Position ids that ignore left-padding for RoPE models."""
+    pos = attention_mask.long().cumsum(dim=-1) - 1
+    return pos.clamp_min(0)
+
+
+def _eos_mask(tokens: torch.Tensor, eos_token_id) -> torch.Tensor:
+    if eos_token_id is None:
+        return torch.zeros_like(tokens, dtype=torch.bool)
+    eos_ids = eos_token_id if isinstance(eos_token_id, (list, tuple, set)) else [eos_token_id]
+    mask = torch.zeros_like(tokens, dtype=torch.bool)
+    for eid in eos_ids:
+        if eid is not None:
+            mask = mask | (tokens == int(eid))
+    return mask
+
+
+def _generation_param(kwargs: dict, name: str, default=None):
+    if name in kwargs and kwargs[name] is not None:
+        return kwargs[name]
+    gen_cfg = kwargs.get("generation_config")
+    if gen_cfg is not None:
+        value = getattr(gen_cfg, name, None)
+        if value is not None:
+            return value
+    return default
+
+
+def _generation_settings(kwargs: dict, prompt_len: int, tokenizer_pad_id, tokenizer_eos_id):
+    gen_cfg = kwargs.get("generation_config")
+    default_max_new = 256
+    max_new_tokens = _generation_param(kwargs, "max_new_tokens", None)
+    if max_new_tokens is None:
+        max_length = _generation_param(kwargs, "max_length", None)
+        if max_length is not None:
+            max_new_tokens = max(1, int(max_length) - int(prompt_len))
+        elif gen_cfg is not None and getattr(gen_cfg, "max_new_tokens", None) is not None:
+            max_new_tokens = int(gen_cfg.max_new_tokens)
+        else:
+            max_new_tokens = default_max_new
+    return {
+        "max_new_tokens": int(max_new_tokens),
+        "do_sample": bool(_generation_param(kwargs, "do_sample", False)),
+        "temperature": float(_generation_param(kwargs, "temperature", 1.0) or 1.0),
+        "top_p": float(_generation_param(kwargs, "top_p", 1.0) or 1.0),
+        "top_k": int(_generation_param(kwargs, "top_k", 0) or 0),
+        "pad_token_id": _generation_param(kwargs, "pad_token_id", tokenizer_pad_id),
+        "eos_token_id": _generation_param(kwargs, "eos_token_id", tokenizer_eos_id),
+    }
 
 
 def _xla_ids_decode(model, input_ids: torch.Tensor, attention_mask,
@@ -123,8 +330,11 @@ def _xla_ids_decode(model, input_ids: torch.Tensor, attention_mask,
         dtype=next(model.parameters()).dtype,
     )
 
-    # Prefill
-    position_ids = torch.arange(bucket, device=device).unsqueeze(0).expand(B, -1)
+    real_lengths = padded_mask.sum(dim=1).long()
+
+    # Prefill. Position ids follow non-pad tokens, not bucket columns; this
+    # preserves RoPE semantics under left-padding.
+    position_ids = _mask_position_ids(padded_mask)
     out = model(
         input_ids=padded_ids,
         attention_mask=full_mask[:, :bucket],
@@ -136,13 +346,14 @@ def _xla_ids_decode(model, input_ids: torch.Tensor, attention_mask,
         xm.mark_step()
     next_token = _pick_token(out.logits[:, -1, :], do_sample, temperature, top_p, top_k)
     generated = [next_token]
-    unfinished = torch.ones(B, dtype=torch.bool, device=device)
+    unfinished = ~_eos_mask(next_token, eos_token_id)
 
-    # Extend full_mask to cover each newly emitted token as decode progresses
+    # First generated token is always part of the returned sequence, including
+    # EOS. Later rows that are already finished emit padding with mask 0.
     full_mask[:, bucket] = 1
 
     for step in range(1, max_new_tokens):
-        pos = torch.full((B, 1), bucket + step - 1, device=device, dtype=torch.long)
+        pos = (real_lengths + step - 1).view(B, 1)
         out = model(
             input_ids=next_token.unsqueeze(-1),
             attention_mask=full_mask[:, :bucket + step],
@@ -150,18 +361,14 @@ def _xla_ids_decode(model, input_ids: torch.Tensor, attention_mask,
             past_key_values=cache,
             use_cache=True,
         )
-        next_token = _pick_token(out.logits[:, -1, :], do_sample, temperature, top_p, top_k)
-        if eos_token_id is not None:
-            eos_ids = eos_token_id if isinstance(eos_token_id, (list, tuple)) else [eos_token_id]
-            just_ended = torch.zeros_like(next_token, dtype=torch.bool)
-            for eid in eos_ids:
-                just_ended = just_ended | (next_token == eid)
-            unfinished = unfinished & ~just_ended
-            if pad_token_id is not None:
-                next_token = torch.where(unfinished, next_token,
-                                         torch.full_like(next_token, pad_token_id))
-        full_mask[:, bucket + step] = 1
+        sampled = _pick_token(out.logits[:, -1, :], do_sample, temperature, top_p, top_k)
+        emitted = unfinished
+        fill = pad_token_id if pad_token_id is not None else 0
+        next_token = torch.where(emitted, sampled, torch.full_like(sampled, fill))
+        just_ended = emitted & _eos_mask(next_token, eos_token_id)
+        full_mask[:, bucket + step] = emitted.long()
         generated.append(next_token)
+        unfinished = unfinished & ~just_ended
         if xm is not None:
             xm.mark_step()
         if not unfinished.any():
@@ -219,8 +426,11 @@ def _xla_embed_decode(model, inputs_embeds: torch.Tensor, attention_mask,
         dtype=inputs_embeds.dtype,
     )
 
-    # Prefill
-    position_ids = torch.arange(bucket, device=device).unsqueeze(0).expand(B, -1)
+    real_lengths = full_mask[:, :bucket].sum(dim=1).long()
+
+    # Prefill. Position ids follow non-pad tokens, not bucket columns; this
+    # preserves RoPE semantics under left-padding.
+    position_ids = _mask_position_ids(full_mask[:, :bucket])
     out = model(
         inputs_embeds=inputs_embeds,
         attention_mask=full_mask[:, :bucket],
@@ -232,10 +442,11 @@ def _xla_embed_decode(model, inputs_embeds: torch.Tensor, attention_mask,
         xm.mark_step()
     next_token = _pick_token(out.logits[:, -1, :], do_sample, temperature, top_p, top_k)
     generated = [next_token]
-    unfinished = torch.ones(B, dtype=torch.bool, device=device)
+    unfinished = ~_eos_mask(next_token, eos_token_id)
+    full_mask[:, bucket] = 1
 
     for step in range(1, max_new_tokens):
-        pos = torch.full((B, 1), bucket + step - 1, device=device, dtype=torch.long)
+        pos = (real_lengths + step - 1).view(B, 1)
         out = model(
             input_ids=next_token.unsqueeze(-1),
             attention_mask=full_mask[:, :bucket + step],
@@ -243,15 +454,14 @@ def _xla_embed_decode(model, inputs_embeds: torch.Tensor, attention_mask,
             past_key_values=cache,
             use_cache=True,
         )
-        next_token = _pick_token(out.logits[:, -1, :], do_sample, temperature, top_p, top_k)
-        if eos_token_id is not None:
-            # Once a sequence emits EOS, freeze it to pad_token_id going forward
-            just_ended = next_token == eos_token_id
-            unfinished = unfinished & ~just_ended
-            if pad_token_id is not None:
-                next_token = torch.where(unfinished, next_token,
-                                         torch.full_like(next_token, pad_token_id))
+        sampled = _pick_token(out.logits[:, -1, :], do_sample, temperature, top_p, top_k)
+        emitted = unfinished
+        fill = pad_token_id if pad_token_id is not None else 0
+        next_token = torch.where(emitted, sampled, torch.full_like(sampled, fill))
+        just_ended = emitted & _eos_mask(next_token, eos_token_id)
+        full_mask[:, bucket + step] = emitted.long()
         generated.append(next_token)
+        unfinished = unfinished & ~just_ended
         if xm is not None:
             xm.mark_step()
         if not unfinished.any():
@@ -317,18 +527,24 @@ def patch_model_for_xla(model, tokenizer,
 
         inputs_embeds = kwargs.get("inputs_embeds")
         if inputs_embeds is not None:
+            settings = _generation_settings(
+                kwargs,
+                int(inputs_embeds.shape[1]),
+                pad_id,
+                tokenizer.eos_token_id,
+            )
             # Soft-opt path: manual static-cache decode
             return _xla_embed_decode(
                 model,
                 inputs_embeds=inputs_embeds,
                 attention_mask=kwargs.get("attention_mask"),
-                max_new_tokens=kwargs.get("max_new_tokens", 256),
-                do_sample=kwargs.get("do_sample", False),
-                temperature=float(kwargs.get("temperature", 1.0)),
-                top_p=float(kwargs.get("top_p", 1.0)),
-                top_k=int(kwargs.get("top_k", 0) or 0),
-                pad_token_id=kwargs.get("pad_token_id", pad_id),
-                eos_token_id=kwargs.get("eos_token_id", tokenizer.eos_token_id),
+                max_new_tokens=settings["max_new_tokens"],
+                do_sample=settings["do_sample"],
+                temperature=settings["temperature"],
+                top_p=settings["top_p"],
+                top_k=settings["top_k"],
+                pad_token_id=settings["pad_token_id"],
+                eos_token_id=settings["eos_token_id"],
                 buckets=buckets,
             )
 
@@ -337,23 +553,29 @@ def patch_model_for_xla(model, tokenizer,
             return original_generate(*args, **kwargs)
 
         orig_len = int(input_ids.shape[-1])
+        settings = _generation_settings(
+            kwargs,
+            orig_len,
+            pad_id,
+            tokenizer.eos_token_id,
+        )
         bucket = _pick_bucket(orig_len, buckets)
         if verbose:
             print(f"[xla-generate] orig_len={orig_len} bucket={bucket} "
-                  f"max_new={kwargs.get('max_new_tokens')}")
+                  f"max_new={settings['max_new_tokens']}")
 
         # Bypass HF generate entirely — its stopping-criteria ops spill XLA vmem.
         return _xla_ids_decode(
             model,
             input_ids=input_ids,
             attention_mask=kwargs.get("attention_mask"),
-            max_new_tokens=kwargs.get("max_new_tokens", 256),
-            do_sample=kwargs.get("do_sample", False),
-            temperature=float(kwargs.get("temperature", 1.0)),
-            top_p=float(kwargs.get("top_p", 1.0)),
-            top_k=int(kwargs.get("top_k", 0) or 0),
-            pad_token_id=kwargs.get("pad_token_id", pad_id),
-            eos_token_id=kwargs.get("eos_token_id", tokenizer.eos_token_id),
+            max_new_tokens=settings["max_new_tokens"],
+            do_sample=settings["do_sample"],
+            temperature=settings["temperature"],
+            top_p=settings["top_p"],
+            top_k=settings["top_k"],
+            pad_token_id=settings["pad_token_id"],
+            eos_token_id=settings["eos_token_id"],
             buckets=buckets,
         )
 

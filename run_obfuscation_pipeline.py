@@ -70,7 +70,7 @@ def parse_arguments():
 
     # Defense selection
     parser.add_argument("--defense_type", type=str, default="obfuscation",
-                        choices=["obfuscation", "surgical", "cast", "circuit_breakers", "alphasteer"],
+                        choices=["none", "obfuscation", "surgical", "cast", "circuit_breakers", "alphasteer"],
                         help="Defense mechanism to evaluate (default: obfuscation)")
     # Surgical hyperparameters
     parser.add_argument("--surgical_ablation_coeff", type=float, default=1.0,
@@ -119,9 +119,9 @@ def parse_arguments():
                         help="Number of PCA directions for the adaptive attack")
     parser.add_argument("--pertinent_layers", type=str, default=None,
                         help="Comma-separated list of specific layers to patch, e.g. '9,10'")
-    parser.add_argument("--projection_mode", type=str, default="hadamard",
-                        choices=["hadamard", "binary", "mask", "scalar_projection", "full"],
-                        help="Projection mode: hadamard (default), binary, mask, scalar_projection, or full")
+    parser.add_argument("--projection_mode", type=str, default="full",
+                        choices=["binary", "mask", "scalar_projection", "full"],
+                        help="Projection mode: full (default), binary, mask, or scalar_projection")
     parser.add_argument("--per_layer_direction", action="store_true",
                         help="Use per-layer refusal directions instead of global r̂")
     parser.add_argument("--writer_output_directions", action="store_true",
@@ -131,6 +131,10 @@ def parse_arguments():
     parser.add_argument("--num_writer_directions", type=int, default=1,
                         help=("Rank-k writer-output directions for APRS. "
                               "Values >1 require --writer_output_directions."))
+    parser.add_argument("--num_reader_directions", type=int, default=1,
+                        help=("Rank-k reader-side correction. Values >1 solve a "
+                              "rank-k least-squares correction at downstream readers "
+                              "to track per-prompt pollution within the writer subspace."))
     parser.add_argument("--obfuscation_writer_only", action="store_true",
                         help="Skip reader (Q/K/V/gate/up) patches; apply writer (o_proj/down_proj) edits only. Ablation.")
 
@@ -145,6 +149,10 @@ def parse_arguments():
                         help="Skip completion/loss evaluations")
     parser.add_argument("--undefended_only", action="store_true",
                         help="Run only undefended baseline evaluations (no defense applied)")
+    parser.add_argument("--skip_undef_utility", action="store_true",
+                        help=("Skip Stage 2c (pre-defense utility benchmarks). The undefended "
+                              "baseline numbers come from a separate undef row, so defense rows "
+                              "do not need to recompute them."))
     parser.add_argument("--llamaguard", action="store_true",
                         help="Run Llama Guard evaluation on completions (Stage 5b)")
     parser.add_argument("--llamaguard_model", type=str, default="meta-llama/Llama-Guard-3-8B",
@@ -250,6 +258,12 @@ def parse_arguments():
                               "for defense/eval artifacts (default: obfuscation)"))
     parser.add_argument("--save_csv", type=str, default=None,
                         help="Path to CSV file to append results to (e.g. results.csv)")
+    parser.add_argument("--xla_buckets", type=str, default="512,1024,2048,4096",
+                        help="Comma-separated sequence buckets for TPU/XLA padding")
+    parser.add_argument("--tpu_native_utility", action="store_true",
+                        help="Use in-process TPU-native GSM8k/MATH500/MMLU evaluation")
+    parser.add_argument("--disable_tpu_native_utility", action="store_true",
+                        help="Force lm-eval-harness utility evaluation even on XLA")
     return parser.parse_args()
 
 
@@ -399,6 +413,7 @@ def run_pipeline(args):
         per_layer_direction=args.per_layer_direction,
         writer_output_directions=args.writer_output_directions,
         num_writer_directions=args.num_writer_directions,
+        num_reader_directions=args.num_reader_directions,
     )
 
     # Match Heretic's dataset sizes: 400 for direction extraction, 100 for val
@@ -410,7 +425,7 @@ def run_pipeline(args):
 
     artifact_dir = cfg.artifact_path()
     artifact_subdir = args.artifact_subdir
-    if args.undefended_only and artifact_subdir == "obfuscation":
+    if (args.undefended_only or args.defense_type == "none") and artifact_subdir == "obfuscation":
         artifact_subdir = "undefended"
     obf_artifact_dir = os.path.join(artifact_dir, artifact_subdir)
     os.makedirs(obf_artifact_dir, exist_ok=True)
@@ -441,12 +456,45 @@ def run_pipeline(args):
     # On TPU/XLA, patch model.generate so every call uses bucket-padded inputs
     # and a static KV cache — amortizes graph compilation across attack/eval
     # suites. Semantics (greedy / sampled tokens) are unchanged.
+    running_xla = False
+    xla_buckets = None
     try:
-        from scripts.tpu.tpu_utils import is_xla_env, patch_model_for_xla
-        if is_xla_env():
-            patch_model_for_xla(model_base.model, model_base.tokenizer)
+        from scripts.tpu.tpu_utils import (
+            is_xla_env,
+            make_bucketed_tokenize_fn,
+            parse_buckets,
+            patch_model_for_xla,
+            set_active_buckets,
+        )
+        running_xla = is_xla_env()
+        xla_buckets = parse_buckets(args.xla_buckets)
+        set_active_buckets(xla_buckets)
+        if running_xla:
+            patch_model_for_xla(
+                model_base.model,
+                model_base.tokenizer,
+                buckets=xla_buckets,
+            )
+            model_base.tokenize_instructions_fn = make_bucketed_tokenize_fn(
+                model_base.tokenize_instructions_fn,
+                model_base.tokenizer,
+                buckets=xla_buckets,
+            )
+            print(f"[xla] bucket-padded tokenization enabled: {list(xla_buckets)}")
     except Exception as _e:
         print(f"[xla-generate] skipped patch: {_e}")
+        running_xla = False
+        try:
+            from scripts.tpu.tpu_utils import parse_buckets, set_active_buckets
+            xla_buckets = parse_buckets(args.xla_buckets)
+            set_active_buckets(xla_buckets)
+        except Exception:
+            xla_buckets = (512, 1024, 2048, 4096)
+
+    use_tpu_native_utility = (
+        (args.tpu_native_utility or running_xla)
+        and not args.disable_tpu_native_utility
+    )
 
     # Load mlabonne datasets
     harmful_train, harmless_train, harmful_val, harmless_val = load_mlabonne_datasets(
@@ -793,24 +841,42 @@ def run_pipeline(args):
     # Stage 2c: Pre-defense utility benchmarks
     # ==================================================================
     lm_harness_undefended = None
-    if not args.skip_lm_harness:
-        from benchmarks.evaluate_lm_harness import run_lm_harness
+    if args.skip_undef_utility:
+        print("[skip_undef_utility] Skipping Stage 2c (pre-defense utility); "
+              "undef baselines come from the dedicated undefended row.")
+    if not args.skip_lm_harness and not args.skip_undef_utility:
         print("=" * 60)
-        print("Stage 2c: Pre-defense utility benchmarks (lm-evaluation-harness) …")
+        backend = "TPU-native" if use_tpu_native_utility else "lm-evaluation-harness"
+        print(f"Stage 2c: Pre-defense utility benchmarks ({backend}) …")
         print("=" * 60)
         try:
             _undef_lm_dir = os.path.join(obf_artifact_dir, "lm_harness_undefended")
-            lm_harness_undefended = run_lm_harness(
-                model=model_base.model,
-                tokenizer=model_base.tokenizer,
-                fwd_pre_hooks=[],
-                fwd_hooks=[],
-                tasks=args.lm_harness_tasks.split(","),
-                n_samples=args.lm_harness_n,
-                output_dir=_undef_lm_dir,
-                batch_size=32,
-                seed=args.seed,
-            )
+            if use_tpu_native_utility:
+                from benchmarks.evaluate_tpu_native import run_tpu_native_utility
+                lm_harness_undefended = run_tpu_native_utility(
+                    model_base,
+                    fwd_pre_hooks=[],
+                    fwd_hooks=[],
+                    tasks=args.lm_harness_tasks.split(","),
+                    n_samples=args.lm_harness_n,
+                    output_dir=_undef_lm_dir,
+                    batch_size=32,
+                    seed=args.seed,
+                    buckets=xla_buckets,
+                )
+            else:
+                from benchmarks.evaluate_lm_harness import run_lm_harness
+                lm_harness_undefended = run_lm_harness(
+                    model=model_base.model,
+                    tokenizer=model_base.tokenizer,
+                    fwd_pre_hooks=[],
+                    fwd_hooks=[],
+                    tasks=args.lm_harness_tasks.split(","),
+                    n_samples=args.lm_harness_n,
+                    output_dir=_undef_lm_dir,
+                    batch_size=32,
+                    seed=args.seed,
+                )
         except Exception as _e:
             print(f"[lm-harness undefended] WARNING: {_e}")
             lm_harness_undefended = None
@@ -829,7 +895,17 @@ def run_pipeline(args):
     defense_fwd_pre_hooks: list = []
     defense_fwd_hooks: list = []
 
-    if args.defense_type == "obfuscation":
+    if args.defense_type == "none":
+        print("[defense] none: evaluating the unmodified model with no defense hooks.")
+        obf_result = {
+            "pertinent_layers": [],
+            "z_sum_norm": 0.0,
+            "num_writers_patched": 0,
+            "num_readers_patched": 0,
+            "undefended_refusal_score": undefended_refusal_mean,
+        }
+
+    elif args.defense_type == "obfuscation":
         # Allow explicit layer override from CLI
         explicit_layers = (
             [int(x) for x in args.pertinent_layers.split(",")]
@@ -1168,11 +1244,18 @@ def run_pipeline(args):
         llamaguard_output = os.path.join(
             obf_artifact_dir, "completions", "llamaguard_evaluation.json",
         )
-        llamaguard_result = run_llamaguard_evaluation(
-            completions_path=completions_path,
-            model_id=args.llamaguard_model,
-            output_path=llamaguard_output,
-        )
+        _target_device = next(model_base.model.parameters()).device
+        print("[Llama Guard] Offloading target model before loading classifier …")
+        model_base.model.to("cpu")
+        _dev_empty_cache()
+        try:
+            llamaguard_result = run_llamaguard_evaluation(
+                completions_path=completions_path,
+                model_id=args.llamaguard_model,
+                output_path=llamaguard_output,
+            )
+        finally:
+            model_base.model.to(_target_device)
 
     # ==================================================================
     # Stage 6: Evaluate abliteration resistance  (NEW)
@@ -1562,10 +1645,9 @@ def run_pipeline(args):
     # ==================================================================
     lm_harness_result = None
     if not args.skip_lm_harness:
-        from benchmarks.evaluate_lm_harness import run_lm_harness
-
         print("=" * 60)
-        print("Stage 9: Utility benchmarks (lm-evaluation-harness) …")
+        backend = "TPU-native" if use_tpu_native_utility else "lm-evaluation-harness"
+        print(f"Stage 9: Utility benchmarks ({backend}) …")
         print("=" * 60)
 
         if not has_inference_hooks:
@@ -1578,17 +1660,32 @@ def run_pipeline(args):
             model_base.tokenizer.save_pretrained(defended_model_path)
 
         try:
-            lm_harness_result = run_lm_harness(
-                model=model_base.model,
-                tokenizer=model_base.tokenizer,
-                fwd_pre_hooks=defense_fwd_pre_hooks,
-                fwd_hooks=defense_fwd_hooks,
-                tasks=args.lm_harness_tasks.split(","),
-                n_samples=args.lm_harness_n,
-                output_dir=os.path.join(obf_artifact_dir, "lm_harness"),
-                batch_size=32,
-                seed=args.seed,
-            )
+            if use_tpu_native_utility:
+                from benchmarks.evaluate_tpu_native import run_tpu_native_utility
+                lm_harness_result = run_tpu_native_utility(
+                    model_base,
+                    fwd_pre_hooks=defense_fwd_pre_hooks,
+                    fwd_hooks=defense_fwd_hooks,
+                    tasks=args.lm_harness_tasks.split(","),
+                    n_samples=args.lm_harness_n,
+                    output_dir=os.path.join(obf_artifact_dir, "lm_harness"),
+                    batch_size=32,
+                    seed=args.seed,
+                    buckets=xla_buckets,
+                )
+            else:
+                from benchmarks.evaluate_lm_harness import run_lm_harness
+                lm_harness_result = run_lm_harness(
+                    model=model_base.model,
+                    tokenizer=model_base.tokenizer,
+                    fwd_pre_hooks=defense_fwd_pre_hooks,
+                    fwd_hooks=defense_fwd_hooks,
+                    tasks=args.lm_harness_tasks.split(","),
+                    n_samples=args.lm_harness_n,
+                    output_dir=os.path.join(obf_artifact_dir, "lm_harness"),
+                    batch_size=32,
+                    seed=args.seed,
+                )
         except Exception as _e:
             print(f"[WARN] lm-harness evaluation failed: {_e}")
             lm_harness_result = None

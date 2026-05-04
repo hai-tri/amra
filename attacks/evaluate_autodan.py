@@ -36,6 +36,23 @@ if _REFUSAL_DIR not in sys.path:
 from pipeline.submodules.select_direction import get_refusal_scores
 from pipeline.utils.hook_utils import add_hooks
 
+try:
+    from scripts.tpu.tpu_utils import (
+        DEFAULT_BUCKETS,
+        _mask_position_ids,
+        get_active_buckets,
+        is_xla_env,
+    )
+except Exception:
+    DEFAULT_BUCKETS = (512, 1024, 2048, 4096)
+    def _mask_position_ids(attention_mask):
+        pos = attention_mask.long().cumsum(dim=-1) - 1
+        return pos.clamp_min(0)
+    def is_xla_env():
+        return False
+    def get_active_buckets():
+        return DEFAULT_BUCKETS
+
 
 # ---------------------------------------------------------------------------
 # Seed jailbreak templates (from the AutoDAN paper appendix + common community
@@ -132,12 +149,45 @@ def _compute_fitness(
         prefix_ids = tokenizer.encode(prefix_str, add_special_tokens=True,
                                       return_tensors="pt")[0].to(device)
         input_ids = torch.cat([prefix_ids, target_ids]).unsqueeze(0)
+        target_start = len(prefix_ids)
+        attention_mask = None
+        position_ids = None
+        if is_xla_env():
+            cur = int(input_ids.shape[-1])
+            target_bucket = next((b for b in get_active_buckets() if cur <= b), None)
+            if target_bucket is not None:
+                pad_amount = target_bucket - cur
+                attention_mask = torch.ones_like(input_ids)
+                if pad_amount > 0:
+                    pad_id = tokenizer.pad_token_id
+                    if pad_id is None:
+                        pad_id = tokenizer.eos_token_id
+                    if pad_id is None:
+                        pad_id = 0
+                    pad = torch.full(
+                        (1, pad_amount),
+                        pad_id,
+                        dtype=input_ids.dtype,
+                        device=input_ids.device,
+                    )
+                    mask_pad = torch.zeros(
+                        (1, pad_amount),
+                        dtype=attention_mask.dtype,
+                        device=attention_mask.device,
+                    )
+                    input_ids = torch.cat([pad, input_ids], dim=-1)
+                    attention_mask = torch.cat([mask_pad, attention_mask], dim=-1)
+                    target_start += pad_amount
+                position_ids = _mask_position_ids(attention_mask)
 
         with add_hooks(fwd_pre_hooks or [], fwd_hooks or []):
             with torch.no_grad():
-                out = model(input_ids)
+                out = model(
+                    input_ids,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                )
         logits = out.logits[0]
-        target_start = len(prefix_ids)
         shift_logits = logits[target_start - 1 : -1]
         loss = F.cross_entropy(shift_logits, target_ids).item()
         losses.append(loss)

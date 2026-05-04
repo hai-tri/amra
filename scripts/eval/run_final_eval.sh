@@ -8,7 +8,6 @@
 # Runs the fixed final comparison set:
 #   - Undefended baseline
 #   - APRS scalar_projection  (epsilon=0.3,   n_cal=128, per-writer dirs)
-#   - APRS hadamard           (epsilon=0.3,   n_cal=128, per-writer dirs)
 #   - APRS full               (epsilon=0.025, n_cal=128, per-writer dirs)
 #   - APRS full writer-only   (epsilon=0.025, n_cal=128, per-writer dirs)
 #   - Baselines: surgical / cast / circuit_breakers / alphasteer
@@ -143,13 +142,6 @@ run_config "final_undefended" \
 
 run_config "final_scalar_eps0_3" \
     --projection_mode scalar_projection \
-    --epsilon 0.3 \
-    --num_calibration_prompts 128 \
-    --per_layer_direction \
-    --writer_output_directions
-
-run_config "final_hadamard_eps0_3" \
-    --projection_mode hadamard \
     --epsilon 0.3 \
     --num_calibration_prompts 128 \
     --per_layer_direction \

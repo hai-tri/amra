@@ -52,6 +52,14 @@ def load_llamaguard(model_id: str = DEFAULT_MODEL, device: str = "auto"):
             device_map=device,
         )
     model.eval()
+    if _dev_is_xla():
+        try:
+            from scripts.tpu.tpu_utils import patch_model_for_xla, get_active_buckets
+            if tokenizer.pad_token is None:
+                tokenizer.pad_token = tokenizer.eos_token
+            patch_model_for_xla(model, tokenizer, buckets=get_active_buckets(), verbose=False)
+        except Exception as exc:
+            print(f"[Llama Guard] XLA generate patch skipped: {exc}")
     return model, tokenizer
 
 

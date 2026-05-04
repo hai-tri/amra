@@ -26,18 +26,17 @@ Alternative for Gemma slot: `google/gemma-3-9b-it` (also supported via the LN di
 
 ## 3. Defense configs (per model)
 
-9 result rows. `run_final_eval.sh` now runs the undefended baseline first, which also generates the cached refusal direction; defended configs can reuse it via `--skip_direction_extraction`.
+8 result rows. `run_final_eval.sh` now runs the undefended baseline first, which also generates the cached refusal direction; defended configs can reuse it via `--skip_direction_extraction`.
 
 ```
 1. undefended                                                             (baseline)
 2. APRS full ε=0.025     --projection_mode full --epsilon 0.025 --per_layer_direction --writer_output_directions
-3. APRS hadamard ε=0.3   --projection_mode hadamard --epsilon 0.3 --per_layer_direction --writer_output_directions
-4. APRS scalar ε=0.3     --projection_mode scalar_projection --epsilon 0.3 --per_layer_direction --writer_output_directions
-5. APRS full ε=0.025 writer-only  (ablation: shows reader patches matter)
-6. surgical              --defense_type surgical
-7. cast                  --defense_type cast
-8. circuit_breakers      --defense_type circuit_breakers
-9. alphasteer            --defense_type alphasteer
+3. APRS scalar ε=0.3     --projection_mode scalar_projection --epsilon 0.3 --per_layer_direction --writer_output_directions
+4. APRS full ε=0.025 writer-only  (ablation: shows reader patches matter)
+5. surgical              --defense_type surgical
+6. cast                  --defense_type cast
+7. circuit_breakers      --defense_type circuit_breakers
+8. alphasteer            --defense_type alphasteer
 ```
 
 APRS writer patches now use **per-writer output refusal directions**: each
@@ -91,8 +90,8 @@ Pipeline flag changes vs current defaults:
 
 ## 6. Statistics
 
-- **Single seed (42)** across the full 9-row × 4-model grid.
-- **Optional if time remains:** three seeds (42, 123, 2024) on the headline row only: APRS hadamard ε=0.3. Launch as separate output dirs rather than blocking the main sweep.
+- **Single seed (42)** across the full 8-row × 4-model grid.
+- **Optional if time remains:** three seeds (42, 123, 2024) on the headline APRS full row. Launch as separate output dirs rather than blocking the main sweep.
 
 ## 7. Pre-launch checklist (before renting H100s)
 
@@ -160,7 +159,7 @@ defenses × full benchmark suite.
 
 | Model × Defense | Pile BPB↓ | Alpaca BPB↓ | GSM8k↑ | MATH500↑ | MMLU↑ | AlpacaEval LC-WR↑ | XSTest over-refusal↓ |
 
-Rows: 4 models × {undefended, APRS (full ε=0.025), APRS (hadamard ε=0.3), APRS
+Rows: 4 models × {undefended, APRS (full ε=0.025), APRS
 (scalar ε=0.3), APRS writer-only, surgical, CAST, circuit_breakers, alphasteer}.
 Source: `run_final_eval.sh`.
 

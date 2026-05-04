@@ -82,14 +82,6 @@ ROW_ORDER = [
         ),
     ),
     (
-        "APRS hadamard eps=0.3",
-        lambda r: (
-            r.get("defense_type") == "obfuscation"
-            and r.get("projection_mode") == "hadamard"
-            and _float(r.get("epsilon")) == 0.3
-        ),
-    ),
-    (
         "APRS scalar eps=0.3",
         lambda r: (
             r.get("defense_type") == "obfuscation"

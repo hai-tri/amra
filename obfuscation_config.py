@@ -36,17 +36,14 @@ class ObfuscationConfig:
     patch_writers: str = "both"
 
     # Projection mode for writer patches.
-    # "hadamard"  = replace r̂ component with r̂ ⊙ ξ, ξ ~ N(0, ε²I).
-    #               Element-wise Gaussian noise weighted by r̂.
+    # "full"      = replace the refusal component with a full random alias vector.
     # "binary"    = replace r̂ component with r̂ ⊙ s, s_i ∈ {-1, +1}.
     #               Rademacher sign flips. Magnitude = ||r̂|| = 1. ε not used.
     # "mask"      = replace r̂ component with r̂ ⊙ m, m_i ∈ {0, 1}.
     #               Random dropout mask. Magnitude ≈ ||r̂||/√2. ε not used.
     # "scalar_projection"  = replace r̂ component with η · r̂ (single random scalar).
     #               Pollution purely along r̂.
-    # "full"      = replace the refusal component with a full random alias vector
-    #               (original behaviour).  Highest pollution, worst utility.
-    projection_mode: str = "hadamard"
+    projection_mode: str = "full"
 
     # Use per-layer refusal directions instead of the global r̂.
     # When True, each writer patch uses mean_diffs[pos, layer] as r̂ for that
@@ -68,6 +65,10 @@ class ObfuscationConfig:
     # ``writer_output_directions=True`` and extract a PCA subspace from
     # harmful-vs-harmless writer outputs at each pertinent layer.
     num_writer_directions: int = 1
+
+    # Use the simultaneous subspace writer edit even when the writer subspace is
+    # rank 1.  The default keeps the existing anchored rank-one writer edit.
+    force_subspace_writer_update: bool = False
 
     # Forward-pass batch size used internally for calibration, writer-output
     # PCA, and probe collection.  Defaults to 16 — increase to ~32 on

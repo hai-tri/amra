@@ -43,6 +43,23 @@ from device_utils import (
     load_model_for_device as _dev_load_model,
 )
 
+try:
+    from scripts.tpu.tpu_utils import (
+        DEFAULT_BUCKETS,
+        _mask_position_ids,
+        get_active_buckets,
+        is_xla_env,
+    )
+except Exception:
+    DEFAULT_BUCKETS = (512, 1024, 2048, 4096)
+    def _mask_position_ids(attention_mask):
+        pos = attention_mask.long().cumsum(dim=-1) - 1
+        return pos.clamp_min(0)
+    def is_xla_env():
+        return False
+    def get_active_buckets():
+        return DEFAULT_BUCKETS
+
 
 # ---------------------------------------------------------------------------
 # SoftOpt attack
@@ -62,6 +79,42 @@ def mellowmax(t: torch.Tensor, alpha=1.0, dim=-1):
     return (1.0 / alpha) * (
         torch.logsumexp(alpha * t, dim=dim)
         - torch.log(torch.tensor(t.shape[-1], dtype=t.dtype, device=t.device))
+    )
+
+
+def _maybe_bucket_embeds(inputs_embeds: torch.Tensor):
+    """Left-pad embedding sequences on XLA to reduce SoftOpt recompiles."""
+    length = int(inputs_embeds.shape[1])
+    mask = torch.ones(
+        inputs_embeds.shape[:2],
+        dtype=torch.long,
+        device=inputs_embeds.device,
+    )
+    if not is_xla_env():
+        return inputs_embeds, mask, 0
+    target = next((b for b in get_active_buckets() if length <= b), None)
+    if target is None:
+        return inputs_embeds, mask, 0
+    pad_amount = target - length
+    if pad_amount == 0:
+        return inputs_embeds, mask, 0
+    pad = torch.zeros(
+        inputs_embeds.shape[0],
+        pad_amount,
+        inputs_embeds.shape[2],
+        dtype=inputs_embeds.dtype,
+        device=inputs_embeds.device,
+    )
+    mask_pad = torch.zeros(
+        inputs_embeds.shape[0],
+        pad_amount,
+        dtype=torch.long,
+        device=inputs_embeds.device,
+    )
+    return (
+        torch.cat([pad, inputs_embeds], dim=1),
+        torch.cat([mask_pad, mask], dim=1),
+        pad_amount,
     )
 
 
@@ -103,8 +156,15 @@ def run_softopt(
     target_embeds = embed(target_ids)
 
     # KV cache for the prefix
+    before_prefill, before_mask, _ = _maybe_bucket_embeds(before_embeds)
+    before_pos = _mask_position_ids(before_mask)
     with torch.no_grad():
-        out = model(inputs_embeds=before_embeds, use_cache=True)
+        out = model(
+            inputs_embeds=before_prefill,
+            attention_mask=before_mask,
+            position_ids=before_pos,
+            use_cache=True,
+        )
         prefix_cache = out.past_key_values
 
     optim_ids = tokenizer(
@@ -122,10 +182,19 @@ def run_softopt(
         inp = torch.cat(
             [optim_embeds, after_embeds.detach(), target_embeds.detach()], dim=1
         )
-        out = model(inputs_embeds=inp, past_key_values=prefix_cache)
+        inp_bucketed, inp_mask, pad_amount = _maybe_bucket_embeds(inp)
+        attention_mask = torch.cat([before_mask, inp_mask], dim=1)
+        before_len = before_mask.sum(dim=1, keepdim=True).long()
+        inp_pos = _mask_position_ids(inp_mask) + before_len
+        out = model(
+            inputs_embeds=inp_bucketed,
+            attention_mask=attention_mask,
+            position_ids=inp_pos,
+            past_key_values=prefix_cache,
+        )
         logits = out.logits
 
-        shift = inp.shape[1] - target_ids.shape[1]
+        shift = pad_amount + inp.shape[1] - target_ids.shape[1]
         shift_logits = logits[..., shift - 1 : -1, :].contiguous()
         loss = torch.nn.functional.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),

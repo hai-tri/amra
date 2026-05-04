@@ -34,6 +34,23 @@ if _REFUSAL_DIR not in sys.path:
 from pipeline.submodules.select_direction import get_refusal_scores
 from pipeline.utils.hook_utils import add_hooks
 
+try:
+    from scripts.tpu.tpu_utils import (
+        DEFAULT_BUCKETS,
+        _mask_position_ids,
+        get_active_buckets,
+        is_xla_env,
+    )
+except Exception:
+    DEFAULT_BUCKETS = (512, 1024, 2048, 4096)
+    def _mask_position_ids(attention_mask):
+        pos = attention_mask.long().cumsum(dim=-1) - 1
+        return pos.clamp_min(0)
+    def is_xla_env():
+        return False
+    def get_active_buckets():
+        return DEFAULT_BUCKETS
+
 
 # ---------------------------------------------------------------------------
 # Core GCG helpers
@@ -49,6 +66,46 @@ def _get_nonascii_toks(tokenizer, device: str) -> torch.Tensor:
     return torch.tensor(non_ascii, device=device)
 
 
+def _maybe_bucket_input_ids(
+    input_ids: torch.Tensor,
+    tokenizer,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], int]:
+    """Left-pad direct attack inputs on XLA so forwards reuse bucket shapes."""
+    if not is_xla_env():
+        return input_ids, None, None, 0
+    cur = int(input_ids.shape[-1])
+    target = None
+    for bucket in get_active_buckets():
+        if cur <= bucket:
+            target = bucket
+            break
+    if target is None:
+        return input_ids, None, None, 0
+    pad_amount = target - cur
+    attention_mask = torch.ones_like(input_ids)
+    if pad_amount == 0:
+        return input_ids, attention_mask, _mask_position_ids(attention_mask), 0
+    pad_id = tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = tokenizer.eos_token_id
+    if pad_id is None:
+        pad_id = 0
+    pad = torch.full(
+        (input_ids.shape[0], pad_amount),
+        pad_id,
+        dtype=input_ids.dtype,
+        device=input_ids.device,
+    )
+    mask_pad = torch.zeros(
+        (input_ids.shape[0], pad_amount),
+        dtype=attention_mask.dtype,
+        device=attention_mask.device,
+    )
+    padded_ids = torch.cat([pad, input_ids], dim=-1)
+    padded_mask = torch.cat([mask_pad, attention_mask], dim=-1)
+    return padded_ids, padded_mask, _mask_position_ids(padded_mask), pad_amount
+
+
 def _build_input(
     tokenizer,
     prompt: str,
@@ -56,7 +113,7 @@ def _build_input(
     target: str,
     device: str,
     add_target: bool = True,
-) -> Tuple[torch.Tensor, int, int]:
+) -> Tuple[torch.Tensor, int, int, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """
     Build a full input_ids tensor:  [prompt_tokens; suffix_tokens; target_tokens?]
 
@@ -83,8 +140,11 @@ def _build_input(
     if add_target:
         parts.append(target_ids)
     input_ids = torch.cat(parts).unsqueeze(0)  # (1, seq_len)
+    input_ids, attention_mask, position_ids, pad_amount = _maybe_bucket_input_ids(input_ids, tokenizer)
+    suffix_start += pad_amount
+    suffix_end += pad_amount
 
-    return input_ids, suffix_start, suffix_end
+    return input_ids, suffix_start, suffix_end, attention_mask, position_ids
 
 
 def _token_gradients(
@@ -93,6 +153,8 @@ def _token_gradients(
     suffix_start: int,
     suffix_end: int,
     target_start: int,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.Tensor] = None,
     fwd_pre_hooks: Optional[list] = None,
     fwd_hooks: Optional[list] = None,
 ) -> torch.Tensor:
@@ -121,7 +183,11 @@ def _token_gradients(
     inputs_embeds = torch.cat([prefix_embeds, suffix_embeds, target_embeds], dim=1)
 
     with add_hooks(fwd_pre_hooks or [], fwd_hooks or []):
-        output = model(inputs_embeds=inputs_embeds)
+        output = model(
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+        )
     logits = output.logits  # (1, seq_len, vocab)
 
     # NLL over target tokens
@@ -140,6 +206,8 @@ def _gcg_step(
     suffix_start: int,
     suffix_end: int,
     target_start: int,
+    attention_mask: Optional[torch.Tensor] = None,
+    position_ids: Optional[torch.Tensor] = None,
     topk: int = 256,
     batch_size: int = 128,
     non_ascii_toks: Optional[torch.Tensor] = None,
@@ -161,6 +229,8 @@ def _gcg_step(
         suffix_start,
         suffix_end,
         target_start,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
         fwd_pre_hooks=fwd_pre_hooks,
         fwd_hooks=fwd_hooks,
     )
@@ -197,7 +267,7 @@ def _gcg_step(
 
         with add_hooks(fwd_pre_hooks or [], fwd_hooks or []):
             with torch.no_grad():
-                out = model(cand_ids)
+                out = model(cand_ids, attention_mask=attention_mask, position_ids=position_ids)
         logits = out.logits[0, target_start - 1 : -1, :]
         labels = cand_ids[0, target_start:]
         loss = F.cross_entropy(logits, labels).item()
@@ -246,7 +316,7 @@ def run_gcg_single(
     suffix_ids = torch.tensor([allowed[i] for i in init_idx], device=device)
 
     # Build initial input
-    input_ids, suf_start, suf_end = _build_input(
+    input_ids, suf_start, suf_end, attention_mask, position_ids = _build_input(
         tokenizer, behavior, suffix_ids, target, str(device), add_target=True
     )
     target_start = suf_end
@@ -258,6 +328,8 @@ def run_gcg_single(
             suf_start, suf_end, target_start,
             topk=topk, batch_size=batch_size,
             non_ascii_toks=non_ascii,
+            attention_mask=attention_mask,
+            position_ids=position_ids,
             fwd_pre_hooks=fwd_pre_hooks,
             fwd_hooks=fwd_hooks,
         )
