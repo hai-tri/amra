@@ -105,6 +105,8 @@ FULL_SUITE_ARGS = (
     "--lm_harness_tasks", "gsm8k,math500,mmlu",
     "--lm_harness_n", "500",
     "--alpacaeval_n", "805",
+    "--skip_integrity_eval",
+    "--skip_adaptive_attacks",
     "--skip_heretic",
     "--pca_top_k", "8",
     "--tpu_native_utility",
@@ -175,7 +177,11 @@ def _run_job(job: dict, args, worker_idx: int) -> int:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / f"{job['tag']}.log"
     env = os.environ.copy()
-    env.setdefault("PJRT_DEVICE", "TPU")
+    if args.chips_per_cell > 0:
+        env.setdefault("PJRT_DEVICE", "TPU")
+    else:
+        env.pop("PJRT_DEVICE", None)
+        env.pop("TPU_VISIBLE_CHIPS", None)
     if args.chips_per_cell > 0 and "TPU_VISIBLE_CHIPS" not in env:
         first_chip = worker_idx * args.chips_per_cell
         chips = range(first_chip, first_chip + args.chips_per_cell)

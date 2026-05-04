@@ -147,6 +147,10 @@ def parse_arguments():
                         help="Fraction of calibration prompts drawn from harmless set (default: 0.5)")
     parser.add_argument("--skip_evaluations", action="store_true",
                         help="Skip completion/loss evaluations")
+    parser.add_argument("--skip_integrity_eval", action="store_true",
+                        help="Skip residual-stream variance/KL diagnostics and plots")
+    parser.add_argument("--skip_adaptive_attacks", action="store_true",
+                        help="Skip PCA/per-layer/sublayer adaptive diagnostic attacks")
     parser.add_argument("--undefended_only", action="store_true",
                         help="Run only undefended baseline evaluations (no defense applied)")
     parser.add_argument("--skip_undef_utility", action="store_true",
@@ -563,19 +567,21 @@ def run_pipeline(args):
     # ==================================================================
     # Stage 2b: Pre-defense integrity measurements  (NEW)
     # ==================================================================
-    print("=" * 60)
-    print("Stage 2b: Collecting pre-defense integrity measurements …")
-    print("=" * 60)
-
     components = ModelComponents(model_base.model)
-    pre_measurements = collect_pre_defense_measurements(
-        model=model_base.model,
-        components=components,
-        harmful_prompts=harmful_val,
-        harmless_prompts=harmless_val,
-        tokenize_fn=model_base.tokenize_instructions_fn,
-        num_prompts=min(obf_cfg.num_calibration_prompts, len(harmful_val)),
-    )
+    pre_measurements = None
+    if not args.skip_integrity_eval:
+        print("=" * 60)
+        print("Stage 2b: Collecting pre-defense integrity measurements …")
+        print("=" * 60)
+
+        pre_measurements = collect_pre_defense_measurements(
+            model=model_base.model,
+            components=components,
+            harmful_prompts=harmful_val,
+            harmless_prompts=harmless_val,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            num_prompts=min(obf_cfg.num_calibration_prompts, len(harmful_val)),
+        )
 
     # Measure undefended refusal score (before defense is applied)
     print("[pre-defense] Measuring undefended refusal score …")
@@ -613,25 +619,28 @@ def run_pipeline(args):
         original_direction=original_direction,
         refusal_toks=model_base.refusal_toks,
     )
-    undefended_adaptive = run_all_adaptive_attacks(
-        model=model_base.model,
-        tokenizer=model_base.tokenizer,
-        tokenize_fn=model_base.tokenize_instructions_fn,
-        block_modules=model_base.model_block_modules,
-        attn_modules=model_base.model_attn_modules,
-        mlp_modules=model_base.model_mlp_modules,
-        harmful_prompts=harmful_val,
-        benign_prompts=harmless_val,
-        original_direction=original_direction,
-        refusal_toks=model_base.refusal_toks,
-        pca_top_k=args.pca_top_k,
-    )
+    undefended_adaptive = None
+    if not args.skip_adaptive_attacks:
+        undefended_adaptive = run_all_adaptive_attacks(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            block_modules=model_base.model_block_modules,
+            attn_modules=model_base.model_attn_modules,
+            mlp_modules=model_base.model_mlp_modules,
+            harmful_prompts=harmful_val,
+            benign_prompts=harmless_val,
+            original_direction=original_direction,
+            refusal_toks=model_base.refusal_toks,
+            pca_top_k=args.pca_top_k,
+        )
     print(f"[pre-defense] Undefended post-abliteration: "
           f"{undefended_abl['arditi_refusal_score']:.4f}")
-    print(f"[pre-defense] Undefended PCA-{args.pca_top_k}: "
-          f"{undefended_adaptive['pca']['post_attack_refusal_score']:.4f}")
-    print(f"[pre-defense] Undefended per-layer: "
-          f"{undefended_adaptive['per_layer']['post_attack_refusal_score']:.4f}")
+    if undefended_adaptive:
+        print(f"[pre-defense] Undefended PCA-{args.pca_top_k}: "
+              f"{undefended_adaptive['pca']['post_attack_refusal_score']:.4f}")
+        print(f"[pre-defense] Undefended per-layer: "
+              f"{undefended_adaptive['per_layer']['post_attack_refusal_score']:.4f}")
 
     undefended_leace = None
     if not args.skip_leace:
@@ -813,8 +822,14 @@ def run_pipeline(args):
                 "writer_attn_max_cos_sim": "",
                 "writer_mlp_max_cos_sim": "",
                 "writer_output_max_cos_sim": "",
-                "pca8_score_undefended":    f"{undefended_adaptive['pca']['post_attack_refusal_score']:.4f}",
-                "perlayer_score_undefended": f"{undefended_adaptive['per_layer']['post_attack_refusal_score']:.4f}",
+                "pca8_score_undefended": (
+                    f"{undefended_adaptive['pca']['post_attack_refusal_score']:.4f}"
+                    if undefended_adaptive else ""
+                ),
+                "perlayer_score_undefended": (
+                    f"{undefended_adaptive['per_layer']['post_attack_refusal_score']:.4f}"
+                    if undefended_adaptive else ""
+                ),
                 "arditi_score_undefended":   f"{undefended_abl['arditi_refusal_score']:.4f}",
                 "gcg_score":  f"{_undef_gcg['post_attack_refusal_score']:.4f}" if _undef_gcg else "",
                 "gcg_asr":    f"{_undef_gcg['asr']:.4f}" if _undef_gcg else "",
@@ -929,8 +944,9 @@ def run_pipeline(args):
         )
         obf_result["undefended_refusal_score"] = undefended_refusal_mean
         obf_result["undefended_arditi_score"] = undefended_abl["arditi_refusal_score"]
-        obf_result["undefended_pca_attack"] = undefended_adaptive["pca"]["post_attack_refusal_score"]
-        obf_result["undefended_per_layer_attack"] = undefended_adaptive["per_layer"]["post_attack_refusal_score"]
+        if undefended_adaptive:
+            obf_result["undefended_pca_attack"] = undefended_adaptive["pca"]["post_attack_refusal_score"]
+            obf_result["undefended_per_layer_attack"] = undefended_adaptive["per_layer"]["post_attack_refusal_score"]
         with open(os.path.join(obf_artifact_dir, "obfuscation_result.json"), "w") as f:
             json.dump(obf_result, f, indent=4)
 
@@ -1069,37 +1085,39 @@ def run_pipeline(args):
     # ==================================================================
     # Stage 3b: Post-defense integrity evaluation  (NEW)
     # ==================================================================
-    print("=" * 60)
-    print("Stage 3b: Evaluating defense integrity (variance + KL) …")
-    print("=" * 60)
+    integrity_result = None
+    if not args.skip_integrity_eval:
+        print("=" * 60)
+        print("Stage 3b: Evaluating defense integrity (variance + KL) …")
+        print("=" * 60)
 
-    integrity_result = evaluate_defense_integrity(
-        model=model_base.model,
-        components=components,
-        harmful_prompts=harmful_val,
-        harmless_prompts=harmless_val,
-        tokenize_fn=model_base.tokenize_instructions_fn,
-        pre_measurements=pre_measurements,
-        num_prompts=min(obf_cfg.num_calibration_prompts, len(harmful_val)),
-        pertinent_layers=obf_result["pertinent_layers"],
-        artifact_dir=obf_artifact_dir,
-        fwd_pre_hooks=defense_fwd_pre_hooks,
-        fwd_hooks=defense_fwd_hooks,
-    )
+        integrity_result = evaluate_defense_integrity(
+            model=model_base.model,
+            components=components,
+            harmful_prompts=harmful_val,
+            harmless_prompts=harmless_val,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            pre_measurements=pre_measurements,
+            num_prompts=min(obf_cfg.num_calibration_prompts, len(harmful_val)),
+            pertinent_layers=obf_result["pertinent_layers"],
+            artifact_dir=obf_artifact_dir,
+            fwd_pre_hooks=defense_fwd_pre_hooks,
+            fwd_hooks=defense_fwd_hooks,
+        )
 
-    # Serialise (filter out non-JSON-safe types)
-    integrity_serialisable = {
-        "kl_harmful": integrity_result["kl_harmful"],
-        "kl_harmless": integrity_result["kl_harmless"],
-        "summary": {
-            k: v if not isinstance(v, list) else v
-            for k, v in integrity_result["summary"].items()
-        },
-        "residual_harmful": integrity_result["residual_harmful"],
-        "residual_harmless": integrity_result["residual_harmless"],
-    }
-    with open(os.path.join(obf_artifact_dir, "integrity_eval.json"), "w") as f:
-        json.dump(integrity_serialisable, f, indent=4)
+        # Serialise (filter out non-JSON-safe types)
+        integrity_serialisable = {
+            "kl_harmful": integrity_result["kl_harmful"],
+            "kl_harmless": integrity_result["kl_harmless"],
+            "summary": {
+                k: v if not isinstance(v, list) else v
+                for k, v in integrity_result["summary"].items()
+            },
+            "residual_harmful": integrity_result["residual_harmful"],
+            "residual_harmless": integrity_result["residual_harmless"],
+        }
+        with open(os.path.join(obf_artifact_dir, "integrity_eval.json"), "w") as f:
+            json.dump(integrity_serialisable, f, indent=4)
 
     # ==================================================================
     # Stage 4–5: Completions and loss evaluation (existing)
@@ -1291,33 +1309,35 @@ def run_pipeline(args):
     # ==================================================================
     # Stage 7: Adaptive attacks  (NEW)
     # ==================================================================
-    print("=" * 60)
-    print("Stage 7: Running adaptive attacks …")
-    print("=" * 60)
+    adaptive_result = None
+    if not args.skip_adaptive_attacks:
+        print("=" * 60)
+        print("Stage 7: Running adaptive attacks …")
+        print("=" * 60)
 
-    adaptive_result = run_all_adaptive_attacks(
-        model=model_base.model,
-        tokenizer=model_base.tokenizer,
-        tokenize_fn=model_base.tokenize_instructions_fn,
-        block_modules=model_base.model_block_modules,
-        attn_modules=model_base.model_attn_modules,
-        mlp_modules=model_base.model_mlp_modules,
-        harmful_prompts=harmful_val,
-        benign_prompts=harmless_val,
-        original_direction=original_direction,
-        refusal_toks=model_base.refusal_toks,
-        pca_top_k=args.pca_top_k,
-        base_fwd_pre_hooks=defense_fwd_pre_hooks,
-        base_fwd_hooks=defense_fwd_hooks,
-    )
+        adaptive_result = run_all_adaptive_attacks(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            block_modules=model_base.model_block_modules,
+            attn_modules=model_base.model_attn_modules,
+            mlp_modules=model_base.model_mlp_modules,
+            harmful_prompts=harmful_val,
+            benign_prompts=harmless_val,
+            original_direction=original_direction,
+            refusal_toks=model_base.refusal_toks,
+            pca_top_k=args.pca_top_k,
+            base_fwd_pre_hooks=defense_fwd_pre_hooks,
+            base_fwd_hooks=defense_fwd_hooks,
+        )
 
-    adaptive_serialisable = {
-        k: {kk: vv.tolist() if isinstance(vv, torch.Tensor) else vv
-            for kk, vv in v.items()}
-        for k, v in adaptive_result.items()
-    }
-    with open(os.path.join(obf_artifact_dir, "adaptive_attacks.json"), "w") as f:
-        json.dump(adaptive_serialisable, f, indent=4)
+        adaptive_serialisable = {
+            k: {kk: vv.tolist() if isinstance(vv, torch.Tensor) else vv
+                for kk, vv in v.items()}
+            for k, v in adaptive_result.items()
+        }
+        with open(os.path.join(obf_artifact_dir, "adaptive_attacks.json"), "w") as f:
+            json.dump(adaptive_serialisable, f, indent=4)
 
     # ==================================================================
     # Stage 7b: LEACE concept-erasure attack (Marks et al. 2023)
@@ -1737,31 +1757,33 @@ def run_pipeline(args):
     print(f"  Writers patched    : {obf_result['num_writers_patched']}")
     print(f"  Readers patched    : {obf_result['num_readers_patched']}")
 
-    s = integrity_result["summary"]
-    print(f"  --- Integrity (variance + KL) ---")
-    print(f"  Harmful  mean |Δσ²/σ²| : "
-          f"attn={s.get('harmful_attn_mean_abs_var_shift', float('nan')):.6f}, "
-          f"mlp={s.get('harmful_mlp_mean_abs_var_shift', float('nan')):.6f}")
-    print(f"  Harmless mean |Δσ²/σ²| : "
-          f"attn={s.get('harmless_attn_mean_abs_var_shift', float('nan')):.6f}, "
-          f"mlp={s.get('harmless_mlp_mean_abs_var_shift', float('nan')):.6f}")
-    print(f"  Harmful  mean cos_sim  : "
-          f"attn={s.get('harmful_attn_mean_cos_sim', float('nan')):.6f}, "
-          f"mlp={s.get('harmful_mlp_mean_cos_sim', float('nan')):.6f}")
-    print(f"  Harmless mean cos_sim  : "
-          f"attn={s.get('harmless_attn_mean_cos_sim', float('nan')):.6f}, "
-          f"mlp={s.get('harmless_mlp_mean_cos_sim', float('nan')):.6f}")
-    print(f"  KL(orig||def) harmful  : {integrity_result['kl_harmful']['kl_forward_mean']:.6f}")
-    print(f"  KL(orig||def) harmless : {integrity_result['kl_harmless']['kl_forward_mean']:.6f}")
-    print(f"  JSD harmful            : {integrity_result['kl_harmful']['jsd_mean']:.6f}")
-    print(f"  JSD harmless           : {integrity_result['kl_harmless']['jsd_mean']:.6f}")
+    if integrity_result:
+        s = integrity_result["summary"]
+        print(f"  --- Integrity (variance + KL) ---")
+        print(f"  Harmful  mean |Δσ²/σ²| : "
+              f"attn={s.get('harmful_attn_mean_abs_var_shift', float('nan')):.6f}, "
+              f"mlp={s.get('harmful_mlp_mean_abs_var_shift', float('nan')):.6f}")
+        print(f"  Harmless mean |Δσ²/σ²| : "
+              f"attn={s.get('harmless_attn_mean_abs_var_shift', float('nan')):.6f}, "
+              f"mlp={s.get('harmless_mlp_mean_abs_var_shift', float('nan')):.6f}")
+        print(f"  Harmful  mean cos_sim  : "
+              f"attn={s.get('harmful_attn_mean_cos_sim', float('nan')):.6f}, "
+              f"mlp={s.get('harmful_mlp_mean_cos_sim', float('nan')):.6f}")
+        print(f"  Harmless mean cos_sim  : "
+              f"attn={s.get('harmless_attn_mean_cos_sim', float('nan')):.6f}, "
+              f"mlp={s.get('harmless_mlp_mean_cos_sim', float('nan')):.6f}")
+        print(f"  KL(orig||def) harmful  : {integrity_result['kl_harmful']['kl_forward_mean']:.6f}")
+        print(f"  KL(orig||def) harmless : {integrity_result['kl_harmless']['kl_forward_mean']:.6f}")
+        print(f"  JSD harmful            : {integrity_result['kl_harmful']['jsd_mean']:.6f}")
+        print(f"  JSD harmless           : {integrity_result['kl_harmless']['jsd_mean']:.6f}")
 
     print(f"  --- Abliteration resistance ---")
     print(f"                        Undefended → Defended")
     print(f"  Refusal score      : {undefended_refusal_mean:.4f} → {abl_result['baseline_refusal_score']:.4f}")
     print(f"  Arditi attack  : {undefended_abl['arditi_refusal_score']:.4f} → {abl_result['arditi_refusal_score']:.4f}")
-    print(f"  PCA-{args.pca_top_k} attack      : {undefended_adaptive['pca']['post_attack_refusal_score']:.4f} → {adaptive_result['pca']['post_attack_refusal_score']:.4f}")
-    print(f"  Per-layer attack   : {undefended_adaptive['per_layer']['post_attack_refusal_score']:.4f} → {adaptive_result['per_layer']['post_attack_refusal_score']:.4f}")
+    if undefended_adaptive and adaptive_result:
+        print(f"  PCA-{args.pca_top_k} attack      : {undefended_adaptive['pca']['post_attack_refusal_score']:.4f} → {adaptive_result['pca']['post_attack_refusal_score']:.4f}")
+        print(f"  Per-layer attack   : {undefended_adaptive['per_layer']['post_attack_refusal_score']:.4f} → {adaptive_result['per_layer']['post_attack_refusal_score']:.4f}")
     print(f"  Max |cos_sim|      : {abl_result['max_cos_sim']:.4f}")
     print(f"  Avg |cos_sim| (pertinent): {abl_result['mean_cos_sim']:.4f}")
 
@@ -1944,14 +1966,32 @@ def run_pipeline(args):
                 f"{writer_output_cos_result['writer_output_max_cos_sim']:.4f}"
                 if writer_output_cos_result else ""
             ),
-            "pca8_score_undefended": f"{undefended_adaptive['pca']['post_attack_refusal_score']:.4f}",
-            "pca8_score_defended": f"{adaptive_result['pca']['post_attack_refusal_score']:.4f}",
-            "perlayer_score_undefended": f"{undefended_adaptive['per_layer']['post_attack_refusal_score']:.4f}",
-            "perlayer_score_defended": f"{adaptive_result['per_layer']['post_attack_refusal_score']:.4f}",
+            "pca8_score_undefended": (
+                f"{undefended_adaptive['pca']['post_attack_refusal_score']:.4f}"
+                if undefended_adaptive else ""
+            ),
+            "pca8_score_defended": (
+                f"{adaptive_result['pca']['post_attack_refusal_score']:.4f}"
+                if adaptive_result else ""
+            ),
+            "perlayer_score_undefended": (
+                f"{undefended_adaptive['per_layer']['post_attack_refusal_score']:.4f}"
+                if undefended_adaptive else ""
+            ),
+            "perlayer_score_defended": (
+                f"{adaptive_result['per_layer']['post_attack_refusal_score']:.4f}"
+                if adaptive_result else ""
+            ),
             "arditi_score_undefended": f"{undefended_abl['arditi_refusal_score']:.4f}",
             "arditi_score_defended": f"{abl_result['arditi_refusal_score']:.4f}",
-            "kl_harmful": f"{integrity_result['kl_harmful']['kl_forward_mean']:.6f}",
-            "kl_harmless": f"{integrity_result['kl_harmless']['kl_forward_mean']:.6f}",
+            "kl_harmful": (
+                f"{integrity_result['kl_harmful']['kl_forward_mean']:.6f}"
+                if integrity_result else ""
+            ),
+            "kl_harmless": (
+                f"{integrity_result['kl_harmless']['kl_forward_mean']:.6f}"
+                if integrity_result else ""
+            ),
             "leace_score_undefended": "",
             "leace_score_defended": "",
             "harmbench_asr": "",
