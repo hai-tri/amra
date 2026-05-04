@@ -89,19 +89,31 @@ def classify_completions(
                 {"role": "user", "content": prompt},
                 {"role": "assistant", "content": response},
             ]
-            input_ids = tokenizer.apply_chat_template(
+            encoded = tokenizer.apply_chat_template(
                 chat, return_tensors="pt"
-            ).to(device)
+            )
+
+            if hasattr(encoded, "input_ids"):
+                model_inputs = {
+                    key: value.to(device)
+                    for key, value in encoded.items()
+                    if torch.is_tensor(value)
+                }
+                input_len = model_inputs["input_ids"].shape[-1]
+            else:
+                input_ids = encoded.to(device)
+                model_inputs = {"input_ids": input_ids}
+                input_len = input_ids.shape[-1]
 
             with torch.no_grad():
                 output = model.generate(
-                    input_ids,
+                    **model_inputs,
                     max_new_tokens=100,
                     pad_token_id=tokenizer.eos_token_id,
                 )
 
             # Decode only the generated tokens
-            generated = output[0][input_ids.shape[-1]:]
+            generated = output[0][input_len:]
             raw_output = tokenizer.decode(generated, skip_special_tokens=True).strip()
 
             is_safe = raw_output.lower().startswith("safe")
