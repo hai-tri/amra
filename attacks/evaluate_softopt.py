@@ -155,18 +155,6 @@ def run_softopt(
     after_embeds = embed(after_ids)
     target_embeds = embed(target_ids)
 
-    # KV cache for the prefix
-    before_prefill, before_mask, _ = _maybe_bucket_embeds(before_embeds)
-    before_pos = _mask_position_ids(before_mask)
-    with torch.no_grad():
-        out = model(
-            inputs_embeds=before_prefill,
-            attention_mask=before_mask,
-            position_ids=before_pos,
-            use_cache=True,
-        )
-        prefix_cache = out.past_key_values
-
     optim_ids = tokenizer(
         config.optim_str_init,
         return_tensors="pt",
@@ -180,22 +168,33 @@ def run_softopt(
     for step in range(config.num_steps):
         optimizer.zero_grad()
         inp = torch.cat(
-            [optim_embeds, after_embeds.detach(), target_embeds.detach()], dim=1
+            [
+                before_embeds.detach(),
+                optim_embeds,
+                after_embeds.detach(),
+                target_embeds.detach(),
+            ],
+            dim=1,
         )
         inp_bucketed, inp_mask, pad_amount = _maybe_bucket_embeds(inp)
-        attention_mask = torch.cat([before_mask, inp_mask], dim=1)
-        before_len = before_mask.sum(dim=1, keepdim=True).long()
-        inp_pos = _mask_position_ids(inp_mask) + before_len
+        inp_pos = _mask_position_ids(inp_mask)
         out = model(
             inputs_embeds=inp_bucketed,
-            attention_mask=attention_mask,
+            attention_mask=inp_mask,
             position_ids=inp_pos,
-            past_key_values=prefix_cache,
         )
         logits = out.logits
 
-        shift = pad_amount + inp.shape[1] - target_ids.shape[1]
-        shift_logits = logits[..., shift - 1 : -1, :].contiguous()
+        target_start = (
+            pad_amount
+            + before_ids.shape[1]
+            + optim_ids.shape[1]
+            + after_ids.shape[1]
+        )
+        target_len = target_ids.shape[1]
+        shift_logits = logits[
+            ..., target_start - 1 : target_start + target_len - 1, :
+        ].contiguous()
         loss = torch.nn.functional.cross_entropy(
             shift_logits.view(-1, shift_logits.size(-1)),
             target_ids.view(-1),
@@ -209,7 +208,9 @@ def run_softopt(
         loss.backward()
         optimizer.step()
 
-    input_embeds = torch.cat([before_embeds, optim_embeds, after_embeds], dim=1)
+    input_embeds = torch.cat(
+        [before_embeds.detach(), optim_embeds, after_embeds.detach()], dim=1
+    )
     return {
         "input_embeds": input_embeds.detach(),
         "losses": losses,
