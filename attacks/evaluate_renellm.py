@@ -295,19 +295,30 @@ def _generate_response(
 ) -> str:
     device = next(model.parameters()).device
     messages = [{"role": "user", "content": prompt}]
-    input_ids = tokenizer.apply_chat_template(
+    encoded = tokenizer.apply_chat_template(
         messages, return_tensors="pt", add_generation_prompt=True
-    ).to(device)
+    )
+    if hasattr(encoded, "input_ids"):
+        model_inputs = {
+            key: value.to(device)
+            for key, value in encoded.items()
+            if torch.is_tensor(value)
+        }
+        input_len = model_inputs["input_ids"].shape[-1]
+    else:
+        input_ids = encoded.to(device)
+        model_inputs = {"input_ids": input_ids}
+        input_len = input_ids.shape[-1]
 
     with add_hooks(fwd_pre_hooks, fwd_hooks):
         with torch.no_grad():
             out = model.generate(
-                input_ids,
+                **model_inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
             )
-    new_tokens = out[0, input_ids.shape[1]:]
+    new_tokens = out[0, input_len:]
     return tokenizer.decode(new_tokens, skip_special_tokens=True)
 
 
