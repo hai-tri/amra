@@ -165,6 +165,24 @@ def _parse_attacker_output(text: str) -> Optional[Dict]:
 # Single model generation helper
 # ---------------------------------------------------------------------------
 
+def _chat_template_model_inputs(tokenizer, messages, device):
+    encoded = tokenizer.apply_chat_template(
+        messages, return_tensors="pt", add_generation_prompt=True
+    )
+    if hasattr(encoded, "input_ids"):
+        model_inputs = {
+            key: value.to(device)
+            for key, value in encoded.items()
+            if torch.is_tensor(value)
+        }
+        input_len = model_inputs["input_ids"].shape[-1]
+    else:
+        input_ids = encoded.to(device)
+        model_inputs = {"input_ids": input_ids}
+        input_len = input_ids.shape[-1]
+    return model_inputs, input_len
+
+
 def _generate_one(
     model,
     tokenizer,
@@ -177,19 +195,17 @@ def _generate_one(
         {"role": "system", "content": system},
         {"role": "user",   "content": user},
     ]
-    input_ids = tokenizer.apply_chat_template(
-        messages, return_tensors="pt", add_generation_prompt=True
-    ).to(device)
+    model_inputs, input_len = _chat_template_model_inputs(tokenizer, messages, device)
 
     with torch.no_grad():
         out = model.generate(
-            input_ids,
+            **model_inputs,
             max_new_tokens=max_new_tokens,
             do_sample=True,
             temperature=1.0,
             pad_token_id=tokenizer.eos_token_id,
         )
-    new_tokens = out[0, input_ids.shape[1]:]
+    new_tokens = out[0, input_len:]
     return tokenizer.decode(new_tokens, skip_special_tokens=True)
 
 
@@ -203,19 +219,17 @@ def _target_generate(
 ) -> str:
     device = next(model.parameters()).device
     messages = [{"role": "user", "content": prompt}]
-    input_ids = tokenizer.apply_chat_template(
-        messages, return_tensors="pt", add_generation_prompt=True
-    ).to(device)
+    model_inputs, input_len = _chat_template_model_inputs(tokenizer, messages, device)
 
     with add_hooks(fwd_pre_hooks, fwd_hooks):
         with torch.no_grad():
             out = model.generate(
-                input_ids,
+                **model_inputs,
                 max_new_tokens=max_new_tokens,
                 do_sample=False,
                 pad_token_id=tokenizer.eos_token_id,
             )
-    new_tokens = out[0, input_ids.shape[1]:]
+    new_tokens = out[0, input_len:]
     return tokenizer.decode(new_tokens, skip_special_tokens=True)
 
 
