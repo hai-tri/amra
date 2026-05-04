@@ -185,6 +185,8 @@ def parse_arguments():
                         help="Comma-separated lm-harness tasks to run (default: gsm8k,math500,mmlu)")
     parser.add_argument("--lm_harness_n", type=int, default=100,
                         help="Number of examples to sample per task (default: 100)")
+    parser.add_argument("--lm_harness_batch_size", type=int, default=8,
+                        help="Batch size for GSM8k/MATH500/MMLU evaluation (default: 8)")
     parser.add_argument("--skip_alpacaeval", action="store_true",
                         help="Skip AlpacaEval generation-quality evaluation (Stage 9b)")
     parser.add_argument("--alpacaeval_n", type=int, default=100,
@@ -875,7 +877,7 @@ def run_pipeline(args):
                     tasks=args.lm_harness_tasks.split(","),
                     n_samples=args.lm_harness_n,
                     output_dir=_undef_lm_dir,
-                    batch_size=64,
+                    batch_size=args.lm_harness_batch_size,
                     seed=args.seed,
                     buckets=xla_buckets,
                 )
@@ -889,7 +891,7 @@ def run_pipeline(args):
                     tasks=args.lm_harness_tasks.split(","),
                     n_samples=args.lm_harness_n,
                     output_dir=_undef_lm_dir,
-                    batch_size=64,
+                    batch_size=args.lm_harness_batch_size,
                     seed=args.seed,
                 )
         except Exception as _e:
@@ -1689,7 +1691,7 @@ def run_pipeline(args):
                     tasks=args.lm_harness_tasks.split(","),
                     n_samples=args.lm_harness_n,
                     output_dir=os.path.join(obf_artifact_dir, "lm_harness"),
-                    batch_size=64,
+                    batch_size=args.lm_harness_batch_size,
                     seed=args.seed,
                     buckets=xla_buckets,
                 )
@@ -1703,7 +1705,7 @@ def run_pipeline(args):
                     tasks=args.lm_harness_tasks.split(","),
                     n_samples=args.lm_harness_n,
                     output_dir=os.path.join(obf_artifact_dir, "lm_harness"),
-                    batch_size=64,
+                    batch_size=args.lm_harness_batch_size,
                     seed=args.seed,
                 )
         except Exception as _e:

@@ -104,6 +104,7 @@ FULL_SUITE_ARGS = (
     "--ce_loss_batch_size", "16",
     "--lm_harness_tasks", "gsm8k,math500,mmlu",
     "--lm_harness_n", "500",
+    "--lm_harness_batch_size", "8",
     "--alpacaeval_n", "805",
     "--skip_integrity_eval",
     "--skip_adaptive_attacks",
@@ -188,6 +189,8 @@ def _run_job(job: dict, args, worker_idx: int) -> int:
         env["TPU_VISIBLE_CHIPS"] = ",".join(str(c) for c in chips)
     env["APRS_TPU_CELL_INDEX"] = str(worker_idx)
     env["APRS_TPU_PARALLEL_CELLS"] = str(args.parallel_cells)
+    env.setdefault("PYTHONUNBUFFERED", "1")
+    env.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
     print(f"[cell {worker_idx}] start {job['tag']} -> {log_path}", flush=True)
     t0 = time.time()
