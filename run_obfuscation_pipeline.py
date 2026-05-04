@@ -860,7 +860,7 @@ def run_pipeline(args):
                     tasks=args.lm_harness_tasks.split(","),
                     n_samples=args.lm_harness_n,
                     output_dir=_undef_lm_dir,
-                    batch_size=32,
+                    batch_size=64,
                     seed=args.seed,
                     buckets=xla_buckets,
                 )
@@ -874,7 +874,7 @@ def run_pipeline(args):
                     tasks=args.lm_harness_tasks.split(","),
                     n_samples=args.lm_harness_n,
                     output_dir=_undef_lm_dir,
-                    batch_size=32,
+                    batch_size=64,
                     seed=args.seed,
                 )
         except Exception as _e:
@@ -1669,7 +1669,7 @@ def run_pipeline(args):
                     tasks=args.lm_harness_tasks.split(","),
                     n_samples=args.lm_harness_n,
                     output_dir=os.path.join(obf_artifact_dir, "lm_harness"),
-                    batch_size=32,
+                    batch_size=64,
                     seed=args.seed,
                     buckets=xla_buckets,
                 )
@@ -1683,7 +1683,7 @@ def run_pipeline(args):
                     tasks=args.lm_harness_tasks.split(","),
                     n_samples=args.lm_harness_n,
                     output_dir=os.path.join(obf_artifact_dir, "lm_harness"),
-                    batch_size=32,
+                    batch_size=64,
                     seed=args.seed,
                 )
         except Exception as _e:
@@ -1710,7 +1710,7 @@ def run_pipeline(args):
                 fwd_hooks=defense_fwd_hooks,
                 n_samples=args.alpacaeval_n,
                 max_new_tokens=args.alpacaeval_max_new_tokens,
-                batch_size=32,
+                batch_size=64,
                 seed=args.seed,
                 run_judge=not args.alpacaeval_skip_judge,
                 annotators_config=args.alpacaeval_annotator,
