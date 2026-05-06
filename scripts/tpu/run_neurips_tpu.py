@@ -82,7 +82,7 @@ DEFENSES = [
     _aprs_row(
         "aprs_qwen_optimal",
         model="Qwen/Qwen3-8B",
-        eps=0.5, layers=20, k_w=1, k_r=8,
+        eps=0.025, layers=20, k_w=1, k_r=8,
     ),
     DefenseRow("surgical", ("--defense_type", "surgical")),
     DefenseRow("cast", ("--defense_type", "cast")),

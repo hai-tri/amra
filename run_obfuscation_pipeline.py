@@ -379,6 +379,13 @@ def filter_data(model_base, harmful_train, harmless_train, harmful_val, harmless
     def filter_examples(dataset, scores, threshold, comparison):
         return [inst for inst, score in zip(dataset, scores.tolist()) if comparison(score, threshold)]
 
+    def keep_filtered_or_original(name, original, filtered):
+        if filtered:
+            print(f"[data_filter] {name}: kept {len(filtered)}/{len(original)}")
+            return filtered
+        print(f"[data_filter] {name}: kept 0/{len(original)}; falling back to unfiltered split")
+        return original
+
     harmful_train_scores = get_refusal_scores(
         model_base.model, harmful_train,
         model_base.tokenize_instructions_fn, model_base.refusal_toks,
@@ -387,8 +394,16 @@ def filter_data(model_base, harmful_train, harmless_train, harmful_val, harmless
         model_base.model, harmless_train,
         model_base.tokenize_instructions_fn, model_base.refusal_toks,
     )
-    harmful_train = filter_examples(harmful_train, harmful_train_scores, 0, lambda x, y: x > y)
-    harmless_train = filter_examples(harmless_train, harmless_train_scores, 0, lambda x, y: x < y)
+    harmful_train = keep_filtered_or_original(
+        "harmful_train",
+        harmful_train,
+        filter_examples(harmful_train, harmful_train_scores, 0, lambda x, y: x > y),
+    )
+    harmless_train = keep_filtered_or_original(
+        "harmless_train",
+        harmless_train,
+        filter_examples(harmless_train, harmless_train_scores, 0, lambda x, y: x < y),
+    )
 
     harmful_val_scores = get_refusal_scores(
         model_base.model, harmful_val,
@@ -398,8 +413,16 @@ def filter_data(model_base, harmful_train, harmless_train, harmful_val, harmless
         model_base.model, harmless_val,
         model_base.tokenize_instructions_fn, model_base.refusal_toks,
     )
-    harmful_val = filter_examples(harmful_val, harmful_val_scores, 0, lambda x, y: x > y)
-    harmless_val = filter_examples(harmless_val, harmless_val_scores, 0, lambda x, y: x < y)
+    harmful_val = keep_filtered_or_original(
+        "harmful_val",
+        harmful_val,
+        filter_examples(harmful_val, harmful_val_scores, 0, lambda x, y: x > y),
+    )
+    harmless_val = keep_filtered_or_original(
+        "harmless_val",
+        harmless_val,
+        filter_examples(harmless_val, harmless_val_scores, 0, lambda x, y: x < y),
+    )
 
     return harmful_train, harmless_train, harmful_val, harmless_val
 
@@ -779,6 +802,7 @@ def run_pipeline(args):
                 "writer_attn_avg_cos_sim", "writer_mlp_avg_cos_sim",
                 "writer_output_avg_cos_sim", "writer_attn_max_cos_sim",
                 "writer_mlp_max_cos_sim", "writer_output_max_cos_sim",
+                "refusal_score_undefended", "refusal_score_defended",
                 "pca8_score_undefended", "pca8_score_defended",
                 "perlayer_score_undefended", "perlayer_score_defended",
                 "arditi_score_undefended", "arditi_score_defended",
@@ -824,6 +848,8 @@ def run_pipeline(args):
                 "writer_attn_max_cos_sim": "",
                 "writer_mlp_max_cos_sim": "",
                 "writer_output_max_cos_sim": "",
+                "refusal_score_undefended": f"{undefended_refusal_mean:.4f}",
+                "refusal_score_defended": f"{undefended_refusal_mean:.4f}",
                 "pca8_score_undefended": (
                     f"{undefended_adaptive['pca']['post_attack_refusal_score']:.4f}"
                     if undefended_adaptive else ""
@@ -1890,6 +1916,7 @@ def run_pipeline(args):
             "writer_attn_avg_cos_sim", "writer_mlp_avg_cos_sim",
             "writer_output_avg_cos_sim", "writer_attn_max_cos_sim",
             "writer_mlp_max_cos_sim", "writer_output_max_cos_sim",
+            "refusal_score_undefended", "refusal_score_defended",
             "pca8_score_undefended", "pca8_score_defended",
             "perlayer_score_undefended", "perlayer_score_defended",
             "arditi_score_undefended", "arditi_score_defended",
@@ -1968,6 +1995,8 @@ def run_pipeline(args):
                 f"{writer_output_cos_result['writer_output_max_cos_sim']:.4f}"
                 if writer_output_cos_result else ""
             ),
+            "refusal_score_undefended": f"{undefended_refusal_mean:.4f}",
+            "refusal_score_defended": f"{abl_result['baseline_refusal_score']:.4f}",
             "pca8_score_undefended": (
                 f"{undefended_adaptive['pca']['post_attack_refusal_score']:.4f}"
                 if undefended_adaptive else ""

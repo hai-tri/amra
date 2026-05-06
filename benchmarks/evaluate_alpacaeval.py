@@ -55,11 +55,25 @@ def load_alpacaeval_prompts(
     ``n`` is provided we deterministically sample ``n`` prompts using
     ``seed`` so subsets are comparable across runs.
     """
-    from datasets import load_dataset
+    if dataset == _DEFAULT_DATASET and split == _DEFAULT_SPLIT:
+        from huggingface_hub import hf_hub_download
 
-    ds = load_dataset(dataset, "alpaca_eval", split=split, trust_remote_code=True)
-    rows = [{"instruction": r["instruction"],
-             "dataset": r.get("dataset", "")} for r in ds]
+        path = hf_hub_download(
+            repo_id=dataset,
+            filename="alpaca_eval.json",
+            repo_type="dataset",
+        )
+        with open(path) as f:
+            ds = json.load(f)
+    else:
+        from datasets import load_dataset
+
+        ds = load_dataset(dataset, split=split)
+
+    rows = [
+        {"instruction": r["instruction"], "dataset": r.get("dataset", "")}
+        for r in ds
+    ]
 
     if n is not None and n < len(rows):
         import random
