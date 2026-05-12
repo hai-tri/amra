@@ -1,47 +1,64 @@
-# APRS requirements
-# Install in two steps to prevent vllm from overwriting the CUDA torch build:
+# APRS legacy pip requirements
+#
+# Canonical dependencies now live in pyproject.toml and should be installed with uv:
+#   uv sync
+#   uv sync --group dev        # optional developer tools
+#
+# This file is kept as a pip fallback.  vLLM is intentionally not included:
+# vLLM 0.7.x conflicts with this repo's NumPy 2.x stack, while newer vLLM
+# releases need a separate Torch/CUDA compatibility pass.  Install it in a
+# dedicated environment for jailbreak-generation jobs that require it.
+#
+# Install in two steps to keep the CUDA torch build pinned:
 #   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124
 #   pip install -r requirements.txt
 #   pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu124  # re-pin after vllm
+#
+# The ranges below intentionally cap fast-moving packages used by the Optuna
+# sweep and lm-evaluation-harness integration.  Widen only after a smoke run.
 
 # Core ML
-transformers>=4.46.3
-accelerate>=1.13.0
-datasets
-peft
-safetensors
-sentencepiece
-protobuf
-tokenizers
+torch==2.5.1
+torchvision==0.20.1
+transformers>=4.56.0,<4.57.0
+accelerate>=1.13.0,<1.14.0
+datasets>=4.5.0,<4.6.0
+peft>=0.17.0,<0.18.0
+safetensors>=0.6.0,<0.7.0
+sentencepiece>=0.2.0,<0.3.0
+protobuf>=5.29.0,<7.0.0
+tokenizers>=0.22.0,<0.23.0
+huggingface_hub>=0.34.0,<0.37.0
 
 # Numerics
-numpy>=2.2.0
-scipy
-scikit-learn
-einops
-jaxtyping
+numpy>=2.2.0,<2.4.0
+scipy>=1.15.0,<1.18.0
+scikit-learn>=1.7.0,<1.9.0
+einops>=0.8.0,<0.9.0
+jaxtyping>=0.3.0,<0.4.0
 
 # Evaluation
-lm_eval
-vllm
-optuna
+lm-eval[hf]>=0.4.8,<0.5.0
+optuna>=4.2.0,<5.0.0
 
 # Utilities
-matplotlib
-tqdm
-pandas
-rouge_score
-nltk
-tabulate
-portalocker
+matplotlib>=3.9.0,<3.11.0
+tqdm>=4.67.0,<5.0.0
+pandas>=2.2.0,<2.4.0
+rouge-score>=0.1.2,<0.2.0
+nltk>=3.9.0,<4.0.0
+tabulate>=0.9.0,<0.10.0
+portalocker>=3.0.0,<4.0.0
 
 # Attacks / pipeline deps
-openai
-anthropic
-requests
+openai>=1.60.0,<3.0.0
+anthropic>=0.45.0,<1.0.0
+requests>=2.32.0,<3.0.0
+litellm>=1.60.0,<2.0.0,!=1.82.7,!=1.82.8
 
 # TPU (optional): install only on TPU VMs. Must match torch version above.
-#   pip install torch_xla[tpu]~=2.5.0 \
+# torch-xla pulls pre-release libtpu wheels, so keep it outside the root lock:
+#   uv pip install --prerelease=allow torch_xla[tpu]~=2.5.0 \
 #     -f https://storage.googleapis.com/libtpu-releases/index.html
 # The code auto-detects XLA via device_utils.py; CUDA/MPS/CPU paths are
 # unchanged. Known TPU limitations: heretic/ (use --skip_heretic) and
