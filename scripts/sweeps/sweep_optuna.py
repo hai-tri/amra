@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """
-Optuna multi-objective NSGA-II sweep over (epsilon, num_layers, k_w, k_r).
+Optuna multi-objective sweep over APRS hyperparameters.
 
 Loads model + extracts undefended refusal direction + measures undefended
 attack baselines + undefended utility once, then runs `n_trials` configs by
-restoring weight snapshots between trials.  Each trial measures both:
+restoring weight snapshots between trials.  Each trial samples:
 
-    refusal_gap  = (undef_base − def_arditi) + (undef_pca8 − def_pca8)
+    epsilon, k_w, k_r, layer_budget
+
+and measures:
+
+    arditi_gap  = undef_base − def_arditi
+    leace_gap   = undef_base − def_leace
+    pca8_gap    = undef_pca8 − def_pca8
     utility_loss = composite of MATH500 / MMLU / Pile-BPB regressions
 
-NSGA-II returns a Pareto front over (refusal_gap, utility_loss) instead of
-collapsing them into a single weighted objective.  Single-objective TPE on
-refusal_gap alone is also available via --objective refusal_only.
+The multi-objective mode returns a Pareto front over
+(arditi_gap, leace_gap, pca8_gap, utility_loss).  Single-objective TPE on
+Arditi-only robustness is still available via --objective refusal_only.
 
 Trial results are logged to an Optuna SQLite study + a flat CSV with all
 metrics.
@@ -52,6 +58,7 @@ from pipeline.submodules.select_direction import select_direction, get_refusal_s
 
 from apply_obfuscation import apply_obfuscation
 from attacks.evaluate_abliteration import evaluate_abliteration_resistance
+from attacks.evaluate_leace_attack import leace_attack
 from obfuscation_config import ObfuscationConfig
 from quick_attack_test import (
     CONFIGS,
@@ -59,6 +66,7 @@ from quick_attack_test import (
     _build_arditi_hooks,
     _build_pca_hooks,
     _extract_pca_directions,
+    _fmt,
     _measure_utility,
     _restore,
     _save,
@@ -69,17 +77,17 @@ import functools
 from quick_attack_test import _QWEN3_TEMPLATE
 
 
-EPSILON_CHOICES = [0.005, 0.025, 0.2, 0.5]
-LAYER_CHOICES = [10, 15, 20, 25, 30, 35, 40]
-K_W_CHOICES = [1, 2, 4, 8, 16]
-K_R_CHOICES = [1, 2, 4, 8, 16]
+LAYER_BUDGET_CHOICES = [4, 8, 12, 16, 20, 24, 30, 32]
+K_CHOICES = [1, 2, 4, 8, 16, 32, 64]
 
 CSV_HEADER = [
-    "trial", "model", "epsilon", "num_layers", "num_writer_directions",
-    "num_reader_directions", "avg_cos_sim",
+    "trial", "model", "epsilon", "layer_budget", "num_layers",
+    "min_layer", "max_layer", "candidate_layers", "pertinent_layers", "num_writer_directions",
+    "num_reader_directions", "num_probe_prompts", "avg_cos_sim",
     "ref_undef_base", "ref_undef_arditi", "ref_undef_pca8",
-    "ref_def_base", "ref_def_arditi", "ref_def_pca8",
-    "arditi_gap", "pca8_gap", "refusal_gap",
+    "ref_undef_leace",
+    "ref_def_base", "ref_def_arditi", "ref_def_pca8", "ref_def_leace",
+    "arditi_gap", "leace_gap", "pca8_gap", "refusal_gap",
     "bpb_undef", "mmlu_undef", "math500_undef",
     "bpb_def", "mmlu_def", "math500_def",
     "bpb_loss", "mmlu_loss", "math500_loss", "utility_loss",
@@ -149,6 +157,46 @@ def _utility_loss(util_undef, util_def):
     }
 
 
+def _select_layers_in_window(mean_diffs, pos, ablation_scores, layer_budget,
+                             min_layer, max_layer):
+    """Select top causal layers within [min_layer, max_layer]."""
+    n_layers = mean_diffs.shape[1]
+    min_layer = max(0, min(int(min_layer), n_layers - 1))
+    max_layer = max(0, min(int(max_layer), n_layers - 1))
+    if min_layer > max_layer:
+        return []
+
+    candidate_set = set(range(min_layer, max_layer + 1))
+    if layer_budget > len(candidate_set):
+        return []
+
+    if ablation_scores is not None:
+        scored_entries = [
+            entry for entry in ablation_scores
+            if entry.get("position") == pos and entry.get("layer") in candidate_set
+        ]
+        if not scored_entries:
+            scored_entries = [
+                entry for entry in ablation_scores
+                if entry.get("layer") in candidate_set
+            ]
+
+        per_layer_best = {}
+        for entry in scored_entries:
+            ell = int(entry["layer"])
+            score = float(entry["refusal_score"])
+            if ell not in per_layer_best or score < per_layer_best[ell]:
+                per_layer_best[ell] = score
+
+        if per_layer_best:
+            sorted_layers = sorted(per_layer_best.items(), key=lambda x: x[1])
+            return sorted(ell for ell, _ in sorted_layers[:layer_budget])
+
+    magnitudes = mean_diffs[pos].norm(dim=-1)
+    ranked = sorted(candidate_set, key=lambda ell: float(magnitudes[ell]), reverse=True)
+    return sorted(ranked[:layer_budget])
+
+
 def main():
     pa = argparse.ArgumentParser()
     pa.add_argument("--model", choices=list(CONFIGS.keys()), required=True)
@@ -164,15 +212,39 @@ def main():
     pa.add_argument("--utility_batch_size", type=int, default=8,
                     help="lm-harness batch size for MMLU / MATH500")
     pa.add_argument("--objective", choices=["multi", "refusal_only"], default="multi",
-                    help="multi = NSGA-II Pareto over (refusal_gap, utility_loss); "
-                         "refusal_only = TPE on refusal_gap (skips utility eval)")
+                    help="multi = Pareto over (Arditi gap, LEACE gap, PCA-8 gap, utility loss); "
+                         "refusal_only = TPE on Arditi gap (skips utility/LEACE)")
+    pa.add_argument("--epsilon_min", type=float, default=0.001)
+    pa.add_argument("--epsilon_max", type=float, default=0.75)
+    pa.add_argument("--min_layer", type=int, default=0,
+                    help="Lowest layer index eligible for APRS edits.")
+    pa.add_argument("--max_layer", type=int, default=-1,
+                    help="Highest eligible layer index; -1 means final layer.")
+    pa.add_argument("--sampler", choices=["tpe", "nsga2"], default="tpe",
+                    help="Sampler for multi-objective sweeps. TPE is more sample-efficient; "
+                         "NSGA-II is useful for large budgets.")
     pa.add_argument("--seed", type=int, default=42)
     pa.add_argument("--study_name", default=None)
     pa.add_argument("--storage", default=None,
                     help="Optuna storage URL (default = SQLite next to CSV)")
+    pa.add_argument("--smoke", action="store_true",
+                    help="Smoke-test mode: 2 trials, tiny eval sizes, skip LEACE.")
     pa.add_argument("--output_dir",
                     default=os.path.join(REPO_DIR, "results", "optuna_sweep"))
     args = pa.parse_args()
+
+    if args.smoke:
+        args.n_trials = min(args.n_trials, 2)
+        args.n = min(args.n, 4)
+        args.num_calibration_prompts = min(args.num_calibration_prompts, 8)
+        args.attack_batch_size = min(args.attack_batch_size, 4)
+        args.forward_batch_size = min(args.forward_batch_size, 4)
+        args.bpb_batches = min(args.bpb_batches, 2)
+        args.mmlu_n = min(args.mmlu_n, 5)
+        args.math500_n = min(args.math500_n, 5)
+        args.utility_batch_size = min(args.utility_batch_size, 2)
+        args.objective = "refusal_only"
+        print("[optuna] SMOKE TEST MODE — tiny evals, no LEACE, 2 trials max")
 
     measure_utility = (args.objective == "multi")
 
@@ -262,8 +334,25 @@ def main():
         undef_pca_dirs,
     )
     ref_undef_pca8 = _refusal(up_pre, up_post)
+    ref_undef_leace = None
+    if measure_utility:
+        undef_leace_res = leace_attack(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            block_modules=model_base.model_block_modules,
+            attn_modules=model_base.model_attn_modules,
+            mlp_modules=model_base.model_mlp_modules,
+            harmful_prompts=harmful_test,
+            benign_prompts=harmless_test,
+            original_direction=direction,
+            refusal_toks=model_base.refusal_toks,
+            batch_size=args.attack_batch_size,
+        )
+        ref_undef_leace = undef_leace_res["post_attack_refusal_score"]
     print(f"  undef_base={ref_undef_base:.4f}  undef_arditi={ref_undef_arditi:.4f}  "
-          f"undef_pca8={ref_undef_pca8:.4f}")
+          f"undef_pca8={ref_undef_pca8:.4f}  "
+          f"undef_leace={ref_undef_leace if ref_undef_leace is not None else 'skipped'}")
 
     util_undef = {"bpb": None, "mmlu": None, "math500": None}
     if measure_utility:
@@ -272,9 +361,9 @@ def main():
             model_base, [], [], args.bpb_batches, args.mmlu_n,
             args.math500_n, args.utility_batch_size,
         )
-        print(f"  undef bpb={util_undef.get('bpb'):.4f}  "
-              f"mmlu={util_undef.get('mmlu'):.4f}  "
-              f"math500={util_undef.get('math500'):.4f}")
+        print(f"  undef bpb={_fmt(util_undef.get('bpb'))}  "
+              f"mmlu={_fmt(util_undef.get('mmlu'))}  "
+              f"math500={_fmt(util_undef.get('math500'))}")
 
     clean_snapshot = _save(model_base.model)
 
@@ -284,14 +373,31 @@ def main():
             csv.writer(f).writerow(CSV_HEADER)
 
     # ── Objective ───────────────────────────────────────────────────────────
+    @torch.no_grad()
     def objective(trial: optuna.trial.Trial):
-        epsilon = trial.suggest_categorical("epsilon", EPSILON_CHOICES)
-        n_layers = trial.suggest_categorical("num_layers", LAYER_CHOICES)
-        k_w = trial.suggest_categorical("k_w", K_W_CHOICES)
-        k_r = trial.suggest_categorical("k_r", K_R_CHOICES)
+        epsilon = trial.suggest_float(
+            "epsilon", args.epsilon_min, args.epsilon_max, log=True
+        )
+        layer_budget = trial.suggest_categorical(
+            "layer_budget", LAYER_BUDGET_CHOICES
+        )
+        k_w = trial.suggest_categorical("k_w", K_CHOICES)
+        k_r = trial.suggest_categorical("k_r", K_CHOICES)
+
+        n_model_layers = model_base.model.config.num_hidden_layers
+        min_layer = max(0, min(args.min_layer, n_model_layers - 1))
+        requested_max_layer = n_model_layers - 1 if args.max_layer < 0 else args.max_layer
+        max_layer = max(0, min(requested_max_layer, n_model_layers - 1))
+        candidate_layers = list(range(min_layer, max_layer + 1))
+        explicit_layers = _select_layers_in_window(
+            mean_diffs_train, pos, ablation_scores, layer_budget,
+            min_layer, max_layer,
+        )
+        num_probe_prompts = min(args.num_calibration_prompts, max(8, k_r))
 
         print("\n" + "=" * 72)
-        print(f"[trial {trial.number}] eps={epsilon} layers={n_layers} "
+        print(f"[trial {trial.number}] eps={epsilon:.6g} "
+              f"budget={layer_budget} window=[{min_layer},{max_layer}] "
               f"k_w={k_w} k_r={k_r}")
         print("=" * 72)
 
@@ -301,21 +407,41 @@ def main():
 
         row = {
             "trial": trial.number, "model": os.path.basename(model_id).lower(),
-            "epsilon": epsilon, "num_layers": n_layers,
+            "epsilon": epsilon, "layer_budget": layer_budget,
+            "num_layers": len(explicit_layers),
+            "min_layer": min_layer, "max_layer": max_layer,
+            "candidate_layers": json.dumps(candidate_layers),
+            "pertinent_layers": json.dumps(explicit_layers),
             "num_writer_directions": k_w, "num_reader_directions": k_r,
+            "num_probe_prompts": num_probe_prompts,
             "ref_undef_base": ref_undef_base,
             "ref_undef_arditi": ref_undef_arditi,
             "ref_undef_pca8": ref_undef_pca8,
+            "ref_undef_leace": ref_undef_leace,
             "bpb_undef": util_undef.get("bpb"),
             "mmlu_undef": util_undef.get("mmlu"),
             "math500_undef": util_undef.get("math500"),
         }
 
         try:
+            if not explicit_layers or len(explicit_layers) != layer_budget:
+                row["status"] = "invalid_layer_window"
+                raise optuna.TrialPruned(
+                    f"invalid layer window: budget={layer_budget}, "
+                    f"window=[{min_layer},{max_layer}]"
+                )
+            if k_w > args.num_calibration_prompts or k_r > args.num_calibration_prompts:
+                row["status"] = "invalid_rank_budget"
+                raise optuna.TrialPruned(
+                    f"rank exceeds calibration/probe budget: k_w={k_w}, "
+                    f"k_r={k_r}, calibration={args.num_calibration_prompts}"
+                )
+
             cfg = ObfuscationConfig(
                 epsilon=epsilon,
-                num_pertinent_layers=n_layers,
+                num_pertinent_layers=layer_budget,
                 num_calibration_prompts=args.num_calibration_prompts,
+                num_probe_prompts=num_probe_prompts,
                 seed=args.seed,
                 projection_mode="full",
                 per_layer_direction=True,
@@ -334,7 +460,8 @@ def main():
                 selected_layer=layer,
                 direction=direction,
                 cfg=cfg,
-                ablation_scores=ablation_scores,
+                ablation_scores=None,
+                explicit_layers=explicit_layers,
             )
             pertinent = obf["pertinent_layers"]
 
@@ -374,22 +501,47 @@ def main():
             )
             ref_def_pca8 = _refusal(dp_pre, dp_post)
 
+            ref_def_leace = None
+            if measure_utility:
+                def_leace_res = leace_attack(
+                    model=model_base.model,
+                    tokenizer=model_base.tokenizer,
+                    tokenize_fn=model_base.tokenize_instructions_fn,
+                    block_modules=model_base.model_block_modules,
+                    attn_modules=model_base.model_attn_modules,
+                    mlp_modules=model_base.model_mlp_modules,
+                    harmful_prompts=harmful_test,
+                    benign_prompts=harmless_test,
+                    original_direction=direction,
+                    refusal_toks=model_base.refusal_toks,
+                    batch_size=args.attack_batch_size,
+                )
+                ref_def_leace = def_leace_res["post_attack_refusal_score"]
+
             arditi_gap = ref_undef_base - ref_def_arditi
+            leace_gap = (
+                ref_undef_base - ref_def_leace
+                if ref_def_leace is not None else 0.0
+            )
             pca8_gap = ref_undef_pca8 - ref_def_pca8
-            refusal_gap = arditi_gap + pca8_gap
+            refusal_gap = arditi_gap + leace_gap
 
             row.update({
                 "avg_cos_sim": avg_cos_sim,
                 "ref_def_base": ref_def_base,
                 "ref_def_arditi": ref_def_arditi,
                 "ref_def_pca8": ref_def_pca8,
+                "ref_def_leace": ref_def_leace,
                 "arditi_gap": arditi_gap,
+                "leace_gap": leace_gap,
                 "pca8_gap": pca8_gap,
                 "refusal_gap": refusal_gap,
             })
             print(f"  def_base={ref_def_base:.4f}  def_arditi={ref_def_arditi:.4f}  "
-                  f"def_pca8={ref_def_pca8:.4f}")
-            print(f"  arditi_gap={arditi_gap:.4f}  pca8_gap={pca8_gap:.4f}  "
+                  f"def_pca8={ref_def_pca8:.4f}  "
+                  f"def_leace={ref_def_leace if ref_def_leace is not None else 'skipped'}")
+            print(f"  arditi_gap={arditi_gap:.4f}  leace_gap={leace_gap:.4f}  "
+                  f"pca8_gap={pca8_gap:.4f}  "
                   f"refusal_gap={refusal_gap:.4f}")
 
             util_def = {"bpb": None, "mmlu": None, "math500": None}
@@ -410,18 +562,22 @@ def main():
                     "math500_loss": losses["math500_loss"],
                     "utility_loss": utility_loss,
                 })
-                print(f"  def bpb={util_def.get('bpb'):.4f}  "
-                      f"mmlu={util_def.get('mmlu'):.4f}  "
-                      f"math500={util_def.get('math500'):.4f}")
+                print(f"  def bpb={_fmt(util_def.get('bpb'))}  "
+                      f"mmlu={_fmt(util_def.get('mmlu'))}  "
+                      f"math500={_fmt(util_def.get('math500'))}")
                 print(f"  utility_loss={utility_loss:.4f}")
 
             row["status"] = "ok"
-            return (refusal_gap, utility_loss) if measure_utility else refusal_gap
+            return (
+                arditi_gap, leace_gap, pca8_gap, utility_loss
+            ) if measure_utility else arditi_gap
+        except optuna.TrialPruned:
+            raise
         except Exception as exc:
             import traceback
             traceback.print_exc()
             row["status"] = f"error: {exc!s}"
-            return (float("inf"), float("inf")) if measure_utility else float("inf")
+            raise optuna.TrialPruned(f"trial failed: {exc!s}")
         finally:
             with open(csv_path, "a", newline="") as f:
                 csv.writer(f).writerow([row.get(k, "") for k in CSV_HEADER])
@@ -431,12 +587,16 @@ def main():
                 torch.cuda.empty_cache()
 
     if measure_utility:
-        # Multi-objective TPE: sample-efficient at small budgets (~30 trials)
-        # where NSGA-II would still be filling its initial population.
-        sampler = optuna.samplers.TPESampler(seed=args.seed, multivariate=True)
+        if args.sampler == "nsga2":
+            sampler = optuna.samplers.NSGAIISampler(seed=args.seed)
+        else:
+            # Multi-objective TPE: sample-efficient at small budgets (~30 trials)
+            # where NSGA-II would still be filling its initial population.
+            sampler = optuna.samplers.TPESampler(seed=args.seed, multivariate=True)
         study = optuna.create_study(
             study_name=study_name, storage=storage,
-            sampler=sampler, directions=["minimize", "minimize"],
+            sampler=sampler,
+            directions=["minimize", "minimize", "minimize", "minimize"],
             load_if_exists=True,
         )
     else:
@@ -448,13 +608,18 @@ def main():
 
     study.optimize(objective, n_trials=args.n_trials, show_progress_bar=False)
 
+    completed = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
     print("\n" + "=" * 72)
-    if measure_utility:
+    if not completed:
+        print("[optuna] done. No trials completed successfully.")
+    elif measure_utility:
         pareto = study.best_trials
         print(f"[optuna] done. Pareto front has {len(pareto)} trials:")
         for t in sorted(pareto, key=lambda x: x.values[0]):
-            print(f"  trial #{t.number}  refusal_gap={t.values[0]:.4f}  "
-                  f"utility_loss={t.values[1]:.4f}  params={t.params}")
+            print(f"  trial #{t.number}  arditi_gap={t.values[0]:.4f}  "
+                  f"leace_gap={t.values[1]:.4f}  "
+                  f"pca8_gap={t.values[2]:.4f}  "
+                  f"utility_loss={t.values[3]:.4f}  params={t.params}")
     else:
         print(f"[optuna] done. best trial #{study.best_trial.number} "
               f"objective={study.best_trial.value:.4f}")
