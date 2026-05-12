@@ -1,6 +1,8 @@
 # APRS — NeurIPS Experiment Plan
 
-Plan of record for the final sweep and paper. Update this file as decisions change.
+Plan of record for the final sweep and paper. Update this file as decisions
+change. For the current Optuna hyperparameter-search command template, see
+`docs/sweep_plan.md`.
 
 ---
 
@@ -13,7 +15,9 @@ Plan of record for the final sweep and paper. Update this file as decisions chan
 
 ## 2. Models
 
-Pin exact Hugging Face IDs in `scripts/setup_h100.sh` and `scripts/run_final_eval.sh` for reproducibility.
+Pin exact Hugging Face IDs in `scripts/setup/setup_h100.sh`,
+`scripts/eval/run_final_eval.sh`, and `scripts/sweeps/sweep_optuna.py` for
+reproducibility.
 
 | Model | HF ID | Arch notes |
 |---|---|---|
@@ -26,7 +30,9 @@ Alternative for Gemma slot: `google/gemma-3-9b-it` (also supported via the LN di
 
 ## 3. Defense configs (per model)
 
-8 result rows. `run_final_eval.sh` now runs the undefended baseline first, which also generates the cached refusal direction; defended configs can reuse it via `--skip_direction_extraction`.
+8 result rows. `scripts/eval/run_final_eval.sh` runs the undefended baseline
+first, which also generates the cached refusal direction; defended configs can
+reuse it via `--skip_direction_extraction`.
 
 ```
 1. undefended                                                             (baseline)
@@ -95,24 +101,61 @@ Pipeline flag changes vs current defaults:
 
 ## 7. Pre-launch checklist (before renting H100s)
 
-- [x] `scripts/setup_h100.sh` — idempotent bootstrap: torch, requirements, HF weight prefetch (4 models × ~16 GB + HarmBench judge + LlamaGuard), HarmBench clone.
-- [x] `scripts/run_final_eval.sh` — takes `--model`, iterates configs, resumes from cached CSVs, forwards attack flags, includes undefended row, writes per-config artifact dirs, uses final utility sample sizes, exits nonzero on config failure, and omits CipherChat/Heretic by default.
-- [x] `scripts/make_tables.py` — pivots `all_results.csv` to LaTeX + markdown with BPB columns and writer-only handling.
+- [x] Root dependency environment migrated to `uv`: canonical deps in
+  `pyproject.toml`, reproducible lock in `uv.lock`, and `requirements.txt`
+  retained only as a legacy pip fallback.
+- [x] `lm-eval` pinned through `pyproject.toml` / `uv.lock`; `requirements.txt`
+  mirrors the same bounded range for pip fallback installs.
+- [x] `scripts/setup/setup_h100.sh` — idempotent bootstrap: torch/deps, HF
+  weight prefetch, HarmBench judge + LlamaGuard, HarmBench clone.
+- [x] `scripts/eval/run_final_eval.sh` — takes `--model`, iterates configs,
+  resumes from cached CSVs, forwards attack flags, includes undefended row,
+  writes per-config artifact dirs, uses final utility sample sizes, exits
+  nonzero on config failure, and omits CipherChat/Heretic by default.
+- [x] `scripts/analysis/make_tables.py` — pivots `all_results.csv` to LaTeX +
+  markdown with BPB columns and writer-only handling.
 - [x] Decoder bug fixed: HarmBench, XSTest, and AlpacaEval decode with the explicit tokenizer.
 - [x] Hook-based baseline bug fixed: integrity, abliteration, adaptive, LEACE, and SoftOpt receive defense hooks.
 - [x] APRS writer-output direction extraction added: `--writer_output_directions`.
-- [ ] Commit all outstanding local changes (`run_obfuscation_pipeline.py`, `apply_obfuscation.py`, `obfuscation_utils.py`, `obfuscation_config.py`, `evaluate_loss.py`, `evaluate_alpacaeval.py`, `scripts/smoke_run.sh`, `PLAN.md`).
-- [ ] `lm_eval` version pinned in `requirements.txt`.
-- [ ] Verify `scripts/smoke_run.sh` passes on a cheap A10 (~20–45 min realistic) using Llama-3-8B.
+- [ ] Verify `scripts/eval/smoke_run.sh` passes on a cheap A10 (~20–45 min realistic) using Llama-3-8B.
 - [ ] **Gemma smoke gate** — a second smoke run on a cheap Gemma-2-9B container to validate `pre_feedforward_layernorm` dispatch + empirical pollution probe on real weights before burning H100 time.
+- [ ] Before launching paid compute, confirm the worktree contains only
+  intentional experiment/config changes and commit or stash anything unrelated.
+
+### Environment setup
+
+Use `uv` as the canonical install path:
+
+```bash
+uv sync
+```
+
+`uv.lock` resolves Linux CUDA PyTorch through the CUDA 12.4 PyTorch index.
+`requirements.txt` remains as a pip fallback, not the source of truth.
+
+Keep `vllm` outside the root environment for now: `vllm 0.7.x` conflicts with
+the repo's NumPy 2.x stack, and newer `vllm` releases need a separate
+Torch/CUDA compatibility pass. Use a dedicated environment for any
+jailbreak-generation job that requires `vllm`.
+
+Keep TPU extras outside the root lock. On TPU VMs only:
+
+```bash
+uv pip install --prerelease=allow torch_xla[tpu]~=2.5.0 \
+  -f https://storage.googleapis.com/libtpu-releases/index.html
+```
 
 ## 8. Execution order
 
-1. **Today (no GPU)**: finish syntax/static checks, commit, and run table renderer on existing CSVs.
-2. **Cheap GPU (~$1–$2)**: Llama-3-8B smoke via `scripts/smoke_run.sh`.
+1. **Today (no GPU)**: run `uv lock --check --no-python-downloads`, syntax/static checks, and table renderer on existing CSVs.
+2. **Cheap GPU (~$1–$2)**: Llama-3-8B smoke via `scripts/eval/smoke_run.sh`.
 3. **Cheap GPU (~$2)**: Gemma-2-9B smoke (architecture-specific gate).
-4. **H100 × 2 for ~2 days**: launch the full sweep via `run_final_eval.sh`.
-5. **Local post-run**: rsync CSVs back, run `make_tables.py`, generate figures, write-up.
+4. **Optuna sweep**: run `scripts/sweeps/sweep_optuna.py` per
+   `docs/sweep_plan.md` to select final APRS hyperparameters.
+5. **H100 × 2 for ~2 days**: launch the full sweep via
+   `scripts/eval/run_final_eval.sh`.
+6. **Local post-run**: rsync CSVs back, run
+   `scripts/analysis/make_tables.py`, generate figures, write-up.
 
 ## 9. Failure-mode watchlist
 
@@ -121,7 +164,9 @@ Pipeline flag changes vs current defaults:
 | GCG OOM on 8B at batch=256 | Drop `--gcg_topk` to 128 |
 | PAIR attacker context overflow | Clamp attacker history |
 | HarmBench judge GPU contention | Load judge on separate device when possible |
-| lm-eval version mismatch | Pin in `requirements.txt` |
+| Dependency drift / lm-eval API mismatch | Use `uv sync` from `uv.lock`; `requirements.txt` is fallback only |
+| vLLM resolver conflict with NumPy 2.x | Keep vLLM jobs in a dedicated environment until compatibility is revalidated |
+| TPU resolver conflict from pre-release libtpu | Install `torch_xla[tpu]` manually on TPU VMs with `--prerelease=allow` |
 | Gemma LN misrouting on real weights | Covered by the Gemma smoke gate (§7) |
 | AlpacaEval judge API failure mid-run | Pipeline falls back to completions-only; re-judge offline |
 | Writer-output directions underperform residual directions | Run one Llama residual-direction fallback row by omitting `--writer_output_directions` if smoke ASR/utility looks off |
@@ -139,8 +184,8 @@ Pipeline flag changes vs current defaults:
 
 ## 11. Tables
 
-`scripts/make_tables.py` pivots `all_results.csv` into LaTeX + markdown. Each
-table has one job — don't cram multiple stories into one.
+`scripts/analysis/make_tables.py` pivots `all_results.csv` into LaTeX +
+markdown. Each table has one job — don't cram multiple stories into one.
 
 ### Main text (3 tables)
 
@@ -151,7 +196,8 @@ justifies ε=0.025.
 | ε | Pile BPB↓ | MMLU↑ | Arditi ASR↓ |
 
 ε values: {0.01, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3} + undefended row.
-Source: `scripts/run_sweep.sh` Sweep 1.
+Source: `scripts/sweeps/run_sweep.sh` Sweep 1, or the Optuna-selected
+configuration exported from `scripts/sweeps/sweep_optuna.py`.
 
 **Table 2 — Main utility** *(§5 Results)*
 Wide. Utility preservation at the chosen ε=0.025, across all 4 models × all
@@ -161,7 +207,7 @@ defenses × full benchmark suite.
 
 Rows: 4 models × {undefended, APRS (full ε=0.025), APRS
 (scalar ε=0.3), APRS writer-only, surgical, CAST, circuit_breakers, alphasteer}.
-Source: `run_final_eval.sh`.
+Source: `scripts/eval/run_final_eval.sh`.
 
 **Table 3 — Main security (headline ASR)** *(§5 Results)*
 Wide. Attack resistance across all 4 models × all defenses × all attacks.
@@ -169,7 +215,7 @@ Wide. Attack resistance across all 4 models × all defenses × all attacks.
 | Model × Defense | Arditi↓ | PCA↓ | per-layer↓ | LEACE↓ | GCG↓ | AutoDAN↓ | PAIR↓ | ReNeLLM↓ | SoftOpt↓ |
 
 Same rows as Table 2. This is the paper's single most-read artifact.
-Source: `run_final_eval.sh`.
+Source: `scripts/eval/run_final_eval.sh`.
 
 ### Appendix tables
 
@@ -191,7 +237,7 @@ ever disagrees with a table number.
 | # | Figure | What it shows | Source |
 |---|---|---|---|
 | 1 | Method schematic | Writer patch (W_O / W_down injects alias) + reader patch (Q/K/V/gate/up compensates) in a transformer block. | Hand-drawn / TikZ |
-| 2 | Residual-stream drift under the patch | 1×3 panel: L2 / variance / cosine vs layer index for an example writer patch. Complements the ε-sweep table. | `scripts/plot_drift_combined.py` (already exists) |
+| 2 | Residual-stream drift under the patch | 1×3 panel: L2 / variance / cosine vs layer index for an example writer patch. Complements the ε-sweep table. | `scripts/analysis/plot_drift_combined.py` |
 | 3 | Main ASR grid (headline) | Grouped bars: attack × defense × model. Headline comparison. | `all_results.csv` |
 | 4 | Security–utility Pareto | Scatter: utility retention (BPB ratio or AlpacaEval LC-win-rate) vs attack resistance. One marker per (defense, model, ε). | `all_results.csv` |
 | 5 | Per-architecture defense generalization | Horizontal bars: Arditi ASR × 4 models × {undefended, APRS, top baseline}. Shows "this is not a Llama-specific trick." | `all_results.csv` |
@@ -221,5 +267,9 @@ ever disagrees with a table number.
 
 ---
 
-*Last updated: 2026-04-24.
-Major code changes this week: explicit tokenizer decoding, hook-aware baseline evaluation, empirical pollution tracking, Gemma `pre_feedforward_layernorm` dispatch, writer-output refusal directions, AlpacaEval integration, bits-per-byte in loss_evals, smoke/final scripts, and table rendering.*
+*Last updated: 2026-05-12.
+Major code changes this period: explicit tokenizer decoding, hook-aware baseline
+evaluation, empirical pollution tracking, Gemma `pre_feedforward_layernorm`
+dispatch, writer-output refusal directions, AlpacaEval integration,
+bits-per-byte in loss_evals, smoke/final scripts, table rendering, Optuna sweep
+driver, and root `uv`/`pyproject.toml`/`uv.lock` dependency management.*
