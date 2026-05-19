@@ -283,14 +283,15 @@ def run_model(model_key):
 
     def _test_gcg():
         from attacks.evaluate_gcg import evaluate_gcg
-        evaluate_gcg(
-            model=model_base.model,
-            tokenizer=model_base.tokenizer,
-            tokenize_fn=model_base.tokenize_instructions_fn,
-            harmful_prompts=harmful_test,
-            refusal_toks=model_base.refusal_toks,
-            n_behaviors=1, num_steps=2, topk=16, batch_size=4,
-        )
+        with torch.enable_grad():
+            evaluate_gcg(
+                model=model_base.model,
+                tokenizer=model_base.tokenizer,
+                tokenize_fn=model_base.tokenize_instructions_fn,
+                harmful_prompts=harmful_test,
+                refusal_toks=model_base.refusal_toks,
+                n_behaviors=1, num_steps=2, topk=16, batch_size=4,
+            )
 
     results["gcg"] = _check("GCG (1 behavior, 2 steps)", _test_gcg)
 
@@ -344,15 +345,17 @@ def run_model(model_key):
 
     def _test_softopt():
         from attacks.evaluate_softopt import run_softopt_evaluation, SoftOptConfig
+        bench = os.path.join(REPO_DIR, "data", "harmbench_test_std.json")
         with tempfile.TemporaryDirectory() as tmp:
-            run_softopt_evaluation(
-                model=model_base.model,
-                tokenizer=model_base.tokenizer,
-                benchmark_path="advbench",
-                output_dir=tmp,
-                softopt_config=SoftOptConfig(num_steps=2),
-                limit=1,
-            )
+            with torch.enable_grad():
+                run_softopt_evaluation(
+                    model=model_base.model,
+                    tokenizer=model_base.tokenizer,
+                    benchmark_path=bench,
+                    output_dir=tmp,
+                    softopt_config=SoftOptConfig(num_steps=2),
+                    limit=1,
+                )
 
     results["softopt"] = _check("SoftOpt (1 behavior, 2 steps)", _test_softopt)
 
