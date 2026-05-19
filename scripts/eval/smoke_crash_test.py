@@ -207,6 +207,8 @@ def run_model(model_key):
     def _test_alphasteer():
         _restore(model_base.model, snap)
         from defenses.apply_alphasteer import apply_alphasteer
+        n_layers = len(model_base.model_block_modules)
+        target = [n_layers // 2, n_layers // 2 + 1, n_layers // 2 + 2]
         apply_alphasteer(
             model=model_base.model,
             tokenizer=model_base.tokenizer,
@@ -215,6 +217,7 @@ def run_model(model_key):
             harmful_prompts=harmful_train[:8],
             harmless_prompts=harmless_train[:8],
             refusal_direction=direction,
+            target_layers=target,
             batch_size=4,
         )
         _refusal([], [])
