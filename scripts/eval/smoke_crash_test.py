@@ -265,14 +265,13 @@ def run_model(model_key):
 
     def _test_leace():
         from attacks.evaluate_leace_attack import leace_attack
-        n_leace = min(3, len(model_base.model_block_modules))
         leace_attack(
             model=model_base.model,
             tokenizer=model_base.tokenizer,
             tokenize_fn=model_base.tokenize_instructions_fn,
-            block_modules=model_base.model_block_modules[:n_leace],
-            attn_modules=model_base.model_attn_modules[:n_leace],
-            mlp_modules=model_base.model_mlp_modules[:n_leace],
+            block_modules=model_base.model_block_modules,
+            attn_modules=model_base.model_attn_modules,
+            mlp_modules=model_base.model_mlp_modules,
             harmful_prompts=harmful_test,
             benign_prompts=harmless_test,
             original_direction=direction,
@@ -287,7 +286,10 @@ def run_model(model_key):
         evaluate_gcg(
             model=model_base.model,
             tokenizer=model_base.tokenizer,
-            n_behaviors=1, steps=2, topk=16, batch_size=4,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            harmful_prompts=harmful_test,
+            refusal_toks=model_base.refusal_toks,
+            n_behaviors=1, num_steps=2, topk=16, batch_size=4,
         )
 
     results["gcg"] = _check("GCG (1 behavior, 2 steps)", _test_gcg)
@@ -297,7 +299,10 @@ def run_model(model_key):
         evaluate_autodan(
             model=model_base.model,
             tokenizer=model_base.tokenizer,
-            n_behaviors=1, steps=2, population=4,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            harmful_prompts=harmful_test,
+            refusal_toks=model_base.refusal_toks,
+            n_behaviors=1, num_steps=2, population_size=4,
         )
 
     results["autodan"] = _check("AutoDAN (1 behavior, 2 steps)", _test_autodan)
@@ -307,6 +312,7 @@ def run_model(model_key):
         evaluate_jailbroken(
             model=model_base.model,
             tokenizer=model_base.tokenizer,
+            harmful_prompts=harmful_test,
             n_behaviors=1, templates=["roleplay"],
         )
 
@@ -317,6 +323,9 @@ def run_model(model_key):
         evaluate_pair(
             model=model_base.model,
             tokenizer=model_base.tokenizer,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            harmful_prompts=harmful_test,
+            refusal_toks=model_base.refusal_toks,
             n_behaviors=1, n_streams=1, n_iterations=1,
         )
 
@@ -327,18 +336,23 @@ def run_model(model_key):
         evaluate_renellm(
             model=model_base.model,
             tokenizer=model_base.tokenizer,
-            n_strategies=1, n_attempts=1,
+            harmful_prompts=harmful_test,
+            n_rewrite_strategies=1, n_scenario_attempts=1,
         )
 
     results["renellm"] = _check("ReNeLLM (1 strategy, 1 attempt)", _test_renellm)
 
     def _test_softopt():
         from attacks.evaluate_softopt import run_softopt_evaluation, SoftOptConfig
-        run_softopt_evaluation(
-            model=model_base.model,
-            tokenizer=model_base.tokenizer,
-            config=SoftOptConfig(limit=1, steps=2),
-        )
+        with tempfile.TemporaryDirectory() as tmp:
+            run_softopt_evaluation(
+                model=model_base.model,
+                tokenizer=model_base.tokenizer,
+                benchmark_path="advbench",
+                output_dir=tmp,
+                softopt_config=SoftOptConfig(num_steps=2),
+                limit=1,
+            )
 
     results["softopt"] = _check("SoftOpt (1 behavior, 2 steps)", _test_softopt)
 
