@@ -52,6 +52,9 @@ def run_heretic_attack(
     n_trials: int = 50,
     n_startup_trials: int = 15,
     system_prompt: str = "You are a helpful assistant.",
+    train_samples: int = 400,
+    eval_samples: int = 100,
+    max_response_length: int = 100,
 ) -> Dict:
     """
     Run Heretic's Optuna-based abliteration against the saved defended model.
@@ -90,28 +93,28 @@ def run_heretic_attack(
         n_trials=n_trials,
         n_startup_trials=n_startup_trials,
         system_prompt=system_prompt,
-        max_response_length=100,
+        max_response_length=max_response_length,
         batch_size=1,
         print_responses=False,
         # Use same datasets as the rest of our pipeline
         good_prompts=DatasetSpecification(
             dataset="mlabonne/harmless_alpaca",
-            split="train[:400]",
+            split=f"train[:{train_samples}]",
             column="text",
         ),
         bad_prompts=DatasetSpecification(
             dataset="mlabonne/harmful_behaviors",
-            split="train[:400]",
+            split=f"train[:{train_samples}]",
             column="text",
         ),
         good_evaluation_prompts=DatasetSpecification(
             dataset="mlabonne/harmless_alpaca",
-            split="test[:100]",
+            split=f"test[:{eval_samples}]",
             column="text",
         ),
         bad_evaluation_prompts=DatasetSpecification(
             dataset="mlabonne/harmful_behaviors",
-            split="test[:100]",
+            split=f"test[:{eval_samples}]",
             column="text",
         ),
         study_checkpoint_dir=os.path.join(artifact_dir, "heretic_checkpoints"),
@@ -128,7 +131,8 @@ def run_heretic_attack(
     bad_prompts = load_prompts(settings, settings.bad_prompts)
 
     # Detect common response prefix (for CoT models)
-    prefix_check_prompts = good_prompts[:50] + bad_prompts[:50]
+    prefix_n = min(50, len(good_prompts), len(bad_prompts))
+    prefix_check_prompts = good_prompts[:prefix_n] + bad_prompts[:prefix_n]
     responses = model.get_responses_batched(prefix_check_prompts)
     model.response_prefix = commonprefix(responses).rstrip(" ")
 
@@ -273,10 +277,16 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", required=True)
     parser.add_argument("--artifact_dir", default="heretic_output")
     parser.add_argument("--n_trials", type=int, default=50)
+    parser.add_argument("--train_samples", type=int, default=400)
+    parser.add_argument("--eval_samples", type=int, default=100)
+    parser.add_argument("--max_response_length", type=int, default=100)
     args = parser.parse_args()
 
     run_heretic_attack(
         defended_model_path=args.model_path,
         artifact_dir=args.artifact_dir,
         n_trials=args.n_trials,
+        train_samples=args.train_samples,
+        eval_samples=args.eval_samples,
+        max_response_length=args.max_response_length,
     )

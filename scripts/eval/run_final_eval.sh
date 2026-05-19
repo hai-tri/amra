@@ -14,7 +14,7 @@
 #
 # For each run, the full benchmark stack is enabled, including:
 #   - HarmBench before attacks
-#   - GCG / AutoDAN / PAIR / ReNeLLM / SoftOpt
+#   - GCG / AutoDAN / Jailbroken / PAIR / ReNeLLM / SoftOpt
 #   - HarmBench re-scoring on post-attack outputs
 #   - XSTest
 #   - utility benchmarks
@@ -22,8 +22,8 @@
 # Notes:
 #   - CipherChat is intentionally omitted from the main sweep; add it through
 #     APRS_EXTRA_FLAGS="--cipherchat" for a supplementary run.
-#   - Heretic is intentionally skipped in the main sweep; it is expensive and
-#     is not represented in the planned headline tables.
+#   - Heretic is skipped by default because it is expensive. Set
+#     APRS_INCLUDE_HERETIC=1 to include it.
 #   - Hook-based defenses are evaluated with runtime hooks for in-process
 #     metrics.
 #   - Additional pipeline flags can be forwarded via APRS_EXTRA_FLAGS.
@@ -34,11 +34,14 @@ set -euo pipefail
 REPO_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 MODEL_ID="meta-llama/Meta-Llama-3-8B-Instruct"
 OUTPUT_BASE="$HOME/aprs_final"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
 EXTRA_FLAGS_STR="${APRS_EXTRA_FLAGS:-}"
+INCLUDE_HERETIC="${APRS_INCLUDE_HERETIC:-0}"
 _EXTRA_PIPELINE_FLAGS=()
 if [[ -n "$EXTRA_FLAGS_STR" ]]; then
     read -r -a _EXTRA_PIPELINE_FLAGS <<< "$EXTRA_FLAGS_STR"
 fi
+read -r -a PYTHON_CMD <<< "$PYTHON_BIN"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -56,22 +59,26 @@ echo "================================================================" | tee "$
 echo " APRS Final Evaluation — $(date)"                                | tee -a "$MASTER_LOG"
 echo " Model      : $MODEL_ID"                                         | tee -a "$MASTER_LOG"
 echo " Output dir : $OUTPUT_BASE"                                      | tee -a "$MASTER_LOG"
+echo " Python     : $PYTHON_BIN"                                       | tee -a "$MASTER_LOG"
 echo " Extra args : ${EXTRA_FLAGS_STR:-<none>}"                        | tee -a "$MASTER_LOG"
 echo "================================================================" | tee -a "$MASTER_LOG"
 
 _ATTACK_FLAGS=(
     --gcg --gcg_n_behaviors 25
     --autodan --autodan_n_behaviors 25
+    --jailbroken --jailbroken_n_behaviors 25
     --pair --pair_n_behaviors 25
     --renellm
     --softopt --softopt_limit 25
 )
 _FINAL_EVAL_FLAGS=(
-    --skip_heretic
     --ce_loss_n_batches 256
     --lm_harness_n 500
     --alpacaeval_n 805
 )
+if [[ "$INCLUDE_HERETIC" != "1" ]]; then
+    _FINAL_EVAL_FLAGS=(--skip_heretic "${_FINAL_EVAL_FLAGS[@]}")
+fi
 
 _DIRECTION_READY=0
 FAILED_CONFIGS=()
@@ -114,7 +121,7 @@ run_config() {
     fi
 
     set +e
-    python3 -u "$REPO_DIR/run_obfuscation_pipeline.py" \
+    "${PYTHON_CMD[@]}" -u "$REPO_DIR/run_obfuscation_pipeline.py" \
         --model_path "$MODEL_ID" \
         --save_csv "$csv_path" \
         --llamaguard \

@@ -209,6 +209,10 @@ def main():
     pa.add_argument("--bpb_batches", type=int, default=32)
     pa.add_argument("--mmlu_n", type=int, default=200)
     pa.add_argument("--math500_n", type=int, default=200)
+    pa.add_argument("--n_train", type=int, default=400,
+                    help="Harmful/harmless training prompts for direction extraction")
+    pa.add_argument("--n_val", type=int, default=100,
+                    help="Harmful/harmless validation prompts for direction selection")
     pa.add_argument("--utility_batch_size", type=int, default=8,
                     help="lm-harness batch size for MMLU / MATH500")
     pa.add_argument("--objective", choices=["multi", "refusal_only"], default="multi",
@@ -236,6 +240,8 @@ def main():
     if args.smoke:
         args.n_trials = min(args.n_trials, 2)
         args.n = min(args.n, 4)
+        args.n_train = min(args.n_train, 16)
+        args.n_val = min(args.n_val, 8)
         args.num_calibration_prompts = min(args.num_calibration_prompts, 8)
         args.attack_batch_size = min(args.attack_batch_size, 4)
         args.forward_batch_size = min(args.forward_batch_size, 4)
@@ -245,6 +251,9 @@ def main():
         args.utility_batch_size = min(args.utility_batch_size, 2)
         args.objective = "refusal_only"
         print("[optuna] SMOKE TEST MODE — tiny evals, no LEACE, 2 trials max")
+
+    layer_budget_choices = [4, 8] if args.smoke else LAYER_BUDGET_CHOICES
+    k_choices = [1, 2, 4, 8] if args.smoke else K_CHOICES
 
     measure_utility = (args.objective == "multi")
 
@@ -265,7 +274,7 @@ def main():
     _setup_tokenizer(model_base, model_id)
 
     harmful_train, harmless_train, harmful_val, harmless_val = load_mlabonne_datasets(
-        n_train=400, n_val=100,
+        n_train=args.n_train, n_val=args.n_val,
     )
     print("\n[optuna] filtering data ...")
     harmful_train, harmless_train, harmful_val, harmless_val = filter_data(
@@ -281,6 +290,7 @@ def main():
         )
         pos, layer, direction = select_direction(
             model_base, harmful_val, harmless_val, mean_diffs_train, artifact_dir=tmp,
+            batch_size=args.attack_batch_size,
         )
         with open(os.path.join(tmp, "direction_evaluations.json")) as f:
             ablation_scores = json.load(f)
@@ -379,10 +389,10 @@ def main():
             "epsilon", args.epsilon_min, args.epsilon_max, log=True
         )
         layer_budget = trial.suggest_categorical(
-            "layer_budget", LAYER_BUDGET_CHOICES
+            "layer_budget", layer_budget_choices
         )
-        k_w = trial.suggest_categorical("k_w", K_CHOICES)
-        k_r = trial.suggest_categorical("k_r", K_CHOICES)
+        k_w = trial.suggest_categorical("k_w", k_choices)
+        k_r = trial.suggest_categorical("k_r", k_choices)
 
         n_model_layers = model_base.model.config.num_hidden_layers
         min_layer = max(0, min(args.min_layer, n_model_layers - 1))

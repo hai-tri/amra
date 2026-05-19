@@ -49,12 +49,19 @@ rouge-score>=0.1.2,<0.2.0
 nltk>=3.9.0,<4.0.0
 tabulate>=0.9.0,<0.10.0
 portalocker>=3.0.0,<4.0.0
+zstandard>=0.23.0,<1.0.0
+hf_transfer>=0.1.9,<1.0.0
 
 # Attacks / pipeline deps
 openai>=1.60.0,<3.0.0
 anthropic>=0.45.0,<1.0.0
 requests>=2.32.0,<3.0.0
 litellm>=1.60.0,<2.0.0,!=1.82.7,!=1.82.8
+pydantic-settings>=2.6.0,<3.0.0
+bitsandbytes~=0.49
+questionary~=2.1
+rich>=14.0.0,<15.0.0
+psutil>=7.0.0,<8.0.0
 
 # TPU (optional): install only on TPU VMs. Must match torch version above.
 # torch-xla pulls pre-release libtpu wheels, so keep it outside the root lock:

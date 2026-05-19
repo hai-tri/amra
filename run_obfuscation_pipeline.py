@@ -26,6 +26,11 @@ import random
 import sys
 import torch
 
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
+
 # Add the existing refusal_direction package to the path
 _REFUSAL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "refusal_direction")
 if _REFUSAL_DIR not in sys.path:
@@ -212,6 +217,12 @@ def parse_arguments():
                         help="Skip Heretic attack evaluation (Stage 8)")
     parser.add_argument("--heretic_trials", type=int, default=50,
                         help="Number of Heretic Optuna trials (default: 50)")
+    parser.add_argument("--heretic_train_samples", type=int, default=400,
+                        help="Heretic train prompts per class (default: 400)")
+    parser.add_argument("--heretic_eval_samples", type=int, default=100,
+                        help="Heretic eval prompts per class (default: 100)")
+    parser.add_argument("--heretic_max_response_length", type=int, default=100,
+                        help="Heretic max response length (default: 100)")
     # GCG
     parser.add_argument("--gcg", action="store_true",
                         help="Run GCG white-box attack (Zou et al. 2023)")
@@ -240,6 +251,14 @@ def parse_arguments():
     parser.add_argument("--cipherchat_ciphers", type=str, default="caesar,base64",
                         help="Comma-separated cipher types to try: "
                              "caesar,morse,ascii,base64 (default: caesar,base64)")
+    # Jailbroken
+    parser.add_argument("--jailbroken", action="store_true",
+                        help="Run Jailbroken static-template attack (Wei et al. 2023)")
+    parser.add_argument("--jailbroken_n_behaviors", type=int, default=25,
+                        help="Number of behaviors to attack with Jailbroken (default: 25)")
+    parser.add_argument("--jailbroken_templates", type=str,
+                        default="roleplay,refusal_suppression,fictional,translation",
+                        help="Comma-separated Jailbroken templates to try")
     # PAIR
     parser.add_argument("--pair", action="store_true",
                         help="Run PAIR black-box attack (Chao et al. 2023)")
@@ -693,7 +712,7 @@ def run_pipeline(args):
         _undef_artifact_dir = obf_artifact_dir
         os.makedirs(_undef_artifact_dir, exist_ok=True)
 
-        _undef_gcg = _undef_autodan = _undef_cipher = None
+        _undef_gcg = _undef_autodan = _undef_cipher = _undef_jailbroken = None
         _undef_pair = _undef_renellm = _undef_softopt = None
 
         if args.gcg:
@@ -741,9 +760,21 @@ def run_pipeline(args):
                 artifact_dir=_undef_artifact_dir,
             )
 
+        if args.jailbroken:
+            from attacks.evaluate_jailbroken import evaluate_jailbroken
+            print("Stage U-4: Jailbroken on undefended model …")
+            _undef_jailbroken = evaluate_jailbroken(
+                model=model_base.model,
+                tokenizer=model_base.tokenizer,
+                harmful_prompts=harmful_val,
+                n_behaviors=args.jailbroken_n_behaviors,
+                templates=args.jailbroken_templates.split(","),
+                artifact_dir=_undef_artifact_dir,
+            )
+
         if args.pair:
             from attacks.evaluate_pair import evaluate_pair
-            print("Stage U-4: PAIR on undefended model …")
+            print("Stage U-5: PAIR on undefended model …")
             _undef_pair = evaluate_pair(
                 model=model_base.model,
                 tokenizer=model_base.tokenizer,
@@ -760,7 +791,7 @@ def run_pipeline(args):
 
         if args.renellm:
             from attacks.evaluate_renellm import evaluate_renellm
-            print("Stage U-5: ReNeLLM on undefended model …")
+            print("Stage U-6: ReNeLLM on undefended model …")
             _undef_renellm = evaluate_renellm(
                 model=model_base.model,
                 tokenizer=model_base.tokenizer,
@@ -773,7 +804,7 @@ def run_pipeline(args):
 
         if args.softopt:
             from attacks.evaluate_softopt import run_softopt_evaluation, SoftOptConfig
-            print("Stage U-6: SoftOpt on undefended model …")
+            print("Stage U-7: SoftOpt on undefended model …")
             device = next(model_base.model.parameters()).device
             softopt_cfg = SoftOptConfig(
                 num_steps=args.softopt_steps,
@@ -813,6 +844,7 @@ def run_pipeline(args):
                 "harmbench_asr_post_gcg",
                 "harmbench_asr_post_autodan",
                 "harmbench_asr_post_cipherchat",
+                "harmbench_asr_post_jailbroken",
                 "harmbench_asr_post_pair",
                 "harmbench_asr_post_renellm",
                 "xstest_over_refusal_rate",
@@ -829,6 +861,7 @@ def run_pipeline(args):
                 "gcg_score", "gcg_asr",
                 "autodan_score", "autodan_asr",
                 "cipherchat_best_asr", "cipherchat_best_cipher",
+                "jailbroken_asr",
                 "pair_score", "pair_asr", "renellm_asr",
             ]
             row = {k: "" for k in _fieldnames}
@@ -865,6 +898,7 @@ def run_pipeline(args):
                 "autodan_asr":   f"{_undef_autodan['asr']:.4f}" if _undef_autodan else "",
                 "cipherchat_best_asr":    f"{_undef_cipher['best_asr']:.4f}" if _undef_cipher else "",
                 "cipherchat_best_cipher": _undef_cipher["best_cipher"] if _undef_cipher else "",
+                "jailbroken_asr": f"{_undef_jailbroken['asr']:.4f}" if _undef_jailbroken else "",
                 "pair_score": f"{_undef_pair['post_attack_refusal_score']:.4f}" if _undef_pair else "",
                 "pair_asr":   f"{_undef_pair['asr']:.4f}" if _undef_pair else "",
                 "renellm_asr": f"{_undef_renellm['asr']:.4f}" if _undef_renellm else "",
@@ -1470,14 +1504,36 @@ def run_pipeline(args):
         )
 
     # ==================================================================
-    # Stage 7f: PAIR black-box attack (Chao et al. 2023)
+    # Stage 7f: Jailbroken prompt-template attack (Wei et al. 2023)
+    # ==================================================================
+    jailbroken_result = None
+    if args.jailbroken:
+        from attacks.evaluate_jailbroken import evaluate_jailbroken
+
+        print("=" * 60)
+        print("Stage 7f: Running Jailbroken attack (Wei et al. 2023) …")
+        print("=" * 60)
+
+        jailbroken_result = evaluate_jailbroken(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            harmful_prompts=harmful_val,
+            fwd_pre_hooks=defense_fwd_pre_hooks,
+            fwd_hooks=defense_fwd_hooks,
+            n_behaviors=args.jailbroken_n_behaviors,
+            templates=args.jailbroken_templates.split(","),
+            artifact_dir=obf_artifact_dir,
+        )
+
+    # ==================================================================
+    # Stage 7g: PAIR black-box attack (Chao et al. 2023)
     # ==================================================================
     pair_result = None
     if args.pair:
         from attacks.evaluate_pair import evaluate_pair
 
         print("=" * 60)
-        print("Stage 7f: Running PAIR attack (Chao et al. 2023) …")
+        print("Stage 7g: Running PAIR attack (Chao et al. 2023) …")
         print("=" * 60)
 
         pair_result = evaluate_pair(
@@ -1497,14 +1553,14 @@ def run_pipeline(args):
         )
 
     # ==================================================================
-    # Stage 7g: ReNeLLM nested jailbreak attack (Ding et al. 2023)
+    # Stage 7h: ReNeLLM nested jailbreak attack (Ding et al. 2023)
     # ==================================================================
     renellm_result = None
     if args.renellm:
         from attacks.evaluate_renellm import evaluate_renellm
 
         print("=" * 60)
-        print("Stage 7g: Running ReNeLLM attack (Ding et al. 2023) …")
+        print("Stage 7h: Running ReNeLLM attack (Ding et al. 2023) …")
         print("=" * 60)
 
         renellm_result = evaluate_renellm(
@@ -1520,12 +1576,12 @@ def run_pipeline(args):
         )
 
     # ==================================================================
-    # Stage 7h: SoftOpt white-box attack
+    # Stage 7i: SoftOpt white-box attack
     # ==================================================================
     softopt_result = None
     if args.softopt:
         print("=" * 60)
-        print("Stage 7c: Running SoftOpt attack …")
+        print("Stage 7i: Running SoftOpt attack …")
         print("=" * 60)
 
         from attacks.evaluate_softopt import run_softopt_evaluation, SoftOptConfig
@@ -1550,7 +1606,7 @@ def run_pipeline(args):
     harmbench_post_attack_results = {}
     if not args.skip_harmbench:
         print("=" * 60)
-        print("Stage 7i: HarmBench ASR on post-attack outputs …")
+        print("Stage 7j: HarmBench ASR on post-attack outputs …")
         print("=" * 60)
 
         try:
@@ -1627,6 +1683,20 @@ def run_pipeline(args):
                     max_new_tokens=cfg.max_new_tokens,
                     artifact_dir=obf_artifact_dir,
                 )
+            if jailbroken_result:
+                jailbroken_behaviors = [r["behavior"] for r in jailbroken_result["per_behavior"]]
+                jailbroken_prompts = [r["best_prompt"] for r in jailbroken_result["per_behavior"]]
+                jailbroken_responses = [r["best_response"] for r in jailbroken_result["per_behavior"]]
+                harmbench_post_attack_results["jailbroken"] = _generate_harmbench_for_attack(
+                    label="jailbroken",
+                    model=model_base.model,
+                    tokenizer=model_base.tokenizer,
+                    tokenize_fn=model_base.tokenize_instructions_fn,
+                    behaviors=jailbroken_behaviors,
+                    attacked_prompts=jailbroken_prompts,
+                    responses=jailbroken_responses,
+                    artifact_dir=obf_artifact_dir,
+                )
             if renellm_result:
                 renellm_behaviors = []
                 renellm_prompts = []
@@ -1682,6 +1752,9 @@ def run_pipeline(args):
                 defended_model_path=defended_model_path,
                 artifact_dir=obf_artifact_dir,
                 n_trials=args.heretic_trials,
+                train_samples=args.heretic_train_samples,
+                eval_samples=args.heretic_eval_samples,
+                max_response_length=args.heretic_max_response_length,
                 system_prompt=SYSTEM_PROMPT,
             )
 
@@ -1836,6 +1909,11 @@ def run_pipeline(args):
         print(f"  Best ASR           : {cipherchat_result['best_asr']:.4f} "
               f"({cipherchat_result['best_cipher']})")
 
+    if jailbroken_result:
+        print(f"  --- Jailbroken attack (Wei et al.) ---")
+        print(f"  ASR                : {jailbroken_result['asr']:.4f} "
+              f"({jailbroken_result['n_jailbroken']}/{jailbroken_result['n_total']})")
+
     if pair_result:
         print(f"  --- PAIR attack (Chao et al.) ---")
         print(f"  Post-attack refusal: {pair_result['post_attack_refusal_score']:.4f}")
@@ -1927,15 +2005,16 @@ def run_pipeline(args):
             "harmbench_asr_post_gcg",
             "harmbench_asr_post_autodan",
             "harmbench_asr_post_cipherchat",
-                "harmbench_asr_post_pair",
-                "harmbench_asr_post_renellm",
-                "xstest_over_refusal_rate",
-                "pile_bpb",
-                "alpaca_bpb",
-                "alpaca_custom_bpb",
-                "gsm8k_exact_match_undefended",
-                "math500_exact_match_undefended",
-                "mmlu_acc_undefended",
+            "harmbench_asr_post_jailbroken",
+            "harmbench_asr_post_pair",
+            "harmbench_asr_post_renellm",
+            "xstest_over_refusal_rate",
+            "pile_bpb",
+            "alpaca_bpb",
+            "alpaca_custom_bpb",
+            "gsm8k_exact_match_undefended",
+            "math500_exact_match_undefended",
+            "mmlu_acc_undefended",
             "gsm8k_exact_match",
             "math500_exact_match",
             "mmlu_acc",
@@ -1951,6 +2030,7 @@ def run_pipeline(args):
             "autodan_asr",
             "cipherchat_best_asr",
             "cipherchat_best_cipher",
+            "jailbroken_asr",
             "pair_score",
             "pair_asr",
             "renellm_asr",
@@ -2030,6 +2110,7 @@ def run_pipeline(args):
             "harmbench_asr_post_gcg": "",
             "harmbench_asr_post_autodan": "",
             "harmbench_asr_post_cipherchat": "",
+            "harmbench_asr_post_jailbroken": "",
             "harmbench_asr_post_pair": "",
             "harmbench_asr_post_renellm": "",
             "xstest_over_refusal_rate": "",
@@ -2051,6 +2132,7 @@ def run_pipeline(args):
             "autodan_asr": "",
             "cipherchat_best_asr": "",
             "cipherchat_best_cipher": "",
+            "jailbroken_asr": "",
             "pair_score": "",
             "pair_asr": "",
             "renellm_asr": "",
@@ -2069,6 +2151,8 @@ def run_pipeline(args):
             row["harmbench_asr_post_autodan"] = f"{harmbench_post_attack_results['autodan']['asr']:.4f}"
         if harmbench_post_attack_results.get("cipherchat"):
             row["harmbench_asr_post_cipherchat"] = f"{harmbench_post_attack_results['cipherchat']['asr']:.4f}"
+        if harmbench_post_attack_results.get("jailbroken"):
+            row["harmbench_asr_post_jailbroken"] = f"{harmbench_post_attack_results['jailbroken']['asr']:.4f}"
         if harmbench_post_attack_results.get("pair"):
             row["harmbench_asr_post_pair"] = f"{harmbench_post_attack_results['pair']['asr']:.4f}"
         if harmbench_post_attack_results.get("renellm"):
@@ -2137,6 +2221,8 @@ def run_pipeline(args):
         if cipherchat_result:
             row["cipherchat_best_asr"]    = f"{cipherchat_result['best_asr']:.4f}"
             row["cipherchat_best_cipher"] = cipherchat_result["best_cipher"] or ""
+        if jailbroken_result:
+            row["jailbroken_asr"] = f"{jailbroken_result['asr']:.4f}"
         if pair_result:
             row["pair_score"] = f"{pair_result['post_attack_refusal_score']:.4f}"
             row["pair_asr"]   = f"{pair_result['asr']:.4f}"

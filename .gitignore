@@ -24,13 +24,20 @@ defended_model/
 # lm-evaluation-harness temp dirs
 lm_eval_*/
 
+# Experiment outputs and local logs
+results/
+watch.log
+watch_*.sh
+*.pid
+*.log
+
 # Environment
 .env
 
 # Private files
 results.csv
 nips_paper_idea.md
+transcript.txt
 
 # Claude Code session state
 .claude/
-
