@@ -261,13 +261,14 @@ def run_model(model_key):
 
     def _test_leace():
         from attacks.evaluate_leace_attack import leace_attack
+        n_leace = min(3, len(model_base.model_block_modules))
         leace_attack(
             model=model_base.model,
             tokenizer=model_base.tokenizer,
             tokenize_fn=model_base.tokenize_instructions_fn,
-            block_modules=model_base.model_block_modules,
-            attn_modules=model_base.model_attn_modules,
-            mlp_modules=model_base.model_mlp_modules,
+            block_modules=model_base.model_block_modules[:n_leace],
+            attn_modules=model_base.model_attn_modules[:n_leace],
+            mlp_modules=model_base.model_mlp_modules[:n_leace],
             harmful_prompts=harmful_test,
             benign_prompts=harmless_test,
             original_direction=direction,
