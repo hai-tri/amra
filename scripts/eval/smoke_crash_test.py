@@ -265,19 +265,24 @@ def run_model(model_key):
 
     def _test_leace():
         from attacks.evaluate_leace_attack import leace_attack
-        leace_attack(
-            model=model_base.model,
-            tokenizer=model_base.tokenizer,
-            tokenize_fn=model_base.tokenize_instructions_fn,
-            block_modules=model_base.model_block_modules,
-            attn_modules=model_base.model_attn_modules,
-            mlp_modules=model_base.model_mlp_modules,
-            harmful_prompts=harmful_test,
-            benign_prompts=harmless_test,
-            original_direction=direction,
-            refusal_toks=model_base.refusal_toks,
-            batch_size=4,
-        )
+        orig_n = model_base.model.config.num_hidden_layers
+        model_base.model.config.num_hidden_layers = min(4, orig_n)
+        try:
+            leace_attack(
+                model=model_base.model,
+                tokenizer=model_base.tokenizer,
+                tokenize_fn=model_base.tokenize_instructions_fn,
+                block_modules=model_base.model_block_modules,
+                attn_modules=model_base.model_attn_modules,
+                mlp_modules=model_base.model_mlp_modules,
+                harmful_prompts=harmful_test,
+                benign_prompts=harmless_test,
+                original_direction=direction,
+                refusal_toks=model_base.refusal_toks,
+                batch_size=4,
+            )
+        finally:
+            model_base.model.config.num_hidden_layers = orig_n
 
     results["leace"] = _check("LEACE", _test_leace)
 
