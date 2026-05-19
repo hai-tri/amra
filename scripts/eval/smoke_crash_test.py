@@ -194,11 +194,9 @@ def run_model(model_key):
         apply_circuit_breakers(
             model=model_base.model,
             tokenizer=model_base.tokenizer,
-            tokenize_fn=model_base.tokenize_instructions_fn,
-            block_modules=model_base.model_block_modules,
             harmful_prompts=harmful_train[:8],
             harmless_prompts=harmless_train[:8],
-            batch_size=1, steps=2,
+            batch_size=1, max_steps=2,
         )
         _refusal([], [])
         _restore(model_base.model, snap)
@@ -215,6 +213,7 @@ def run_model(model_key):
             block_modules=model_base.model_block_modules,
             harmful_prompts=harmful_train[:8],
             harmless_prompts=harmless_train[:8],
+            refusal_direction=direction,
             batch_size=4,
         )
         _refusal([], [])
