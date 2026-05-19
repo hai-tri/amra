@@ -195,7 +195,11 @@ def _generate_one(
         {"role": "system", "content": system},
         {"role": "user",   "content": user},
     ]
-    model_inputs, input_len = _chat_template_model_inputs(tokenizer, messages, device)
+    try:
+        model_inputs, input_len = _chat_template_model_inputs(tokenizer, messages, device)
+    except Exception:
+        messages = [{"role": "user", "content": system + "\n\n" + user}]
+        model_inputs, input_len = _chat_template_model_inputs(tokenizer, messages, device)
 
     with torch.no_grad():
         out = model.generate(
