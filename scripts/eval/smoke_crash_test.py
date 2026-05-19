@@ -191,13 +191,14 @@ def run_model(model_key):
     def _test_circuit_breakers():
         _restore(model_base.model, snap)
         from defenses.apply_circuit_breakers import apply_circuit_breakers
-        apply_circuit_breakers(
-            model=model_base.model,
-            tokenizer=model_base.tokenizer,
-            harmful_prompts=harmful_train[:8],
-            harmless_prompts=harmless_train[:8],
-            batch_size=1, max_steps=2,
-        )
+        with torch.enable_grad():
+            apply_circuit_breakers(
+                model=model_base.model,
+                tokenizer=model_base.tokenizer,
+                harmful_prompts=harmful_train[:8],
+                harmless_prompts=harmless_train[:8],
+                batch_size=1, max_steps=2,
+            )
         _refusal([], [])
         _restore(model_base.model, snap)
 
