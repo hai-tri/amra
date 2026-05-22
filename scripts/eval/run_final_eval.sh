@@ -70,6 +70,7 @@ _ATTACK_FLAGS=(
     --pair --pair_n_behaviors 25
     --renellm
     --softopt --softopt_limit 25
+    --nonlinear_probe
 )
 _FINAL_EVAL_FLAGS=(
     --ce_loss_n_batches 256
@@ -146,13 +147,6 @@ run_config() {
 
 run_config "final_undefended" \
     --undefended_only
-
-run_config "final_scalar_eps0_3" \
-    --projection_mode scalar_projection \
-    --epsilon 0.3 \
-    --num_calibration_prompts 128 \
-    --per_layer_direction \
-    --writer_output_directions
 
 run_config "final_full_eps0_025" \
     --projection_mode full \

@@ -286,6 +286,30 @@ def run_model(model_key):
 
     results["leace"] = _check("LEACE", _test_leace)
 
+    def _test_nonlinear_probe():
+        from attacks.evaluate_nonlinear_probe import nonlinear_probe_attack
+        orig_n = model_base.model.config.num_hidden_layers
+        model_base.model.config.num_hidden_layers = min(4, orig_n)
+        try:
+            nonlinear_probe_attack(
+                model=model_base.model,
+                tokenizer=model_base.tokenizer,
+                tokenize_fn=model_base.tokenize_instructions_fn,
+                block_modules=model_base.model_block_modules,
+                attn_modules=model_base.model_attn_modules,
+                mlp_modules=model_base.model_mlp_modules,
+                harmful_prompts=harmful_test,
+                benign_prompts=harmless_test,
+                original_direction=direction,
+                refusal_toks=model_base.refusal_toks,
+                batch_size=4,
+                nlprobe_epochs=5,
+            )
+        finally:
+            model_base.model.config.num_hidden_layers = orig_n
+
+    results["nonlinear_probe"] = _check("Nonlinear Probe", _test_nonlinear_probe)
+
     def _test_gcg():
         from attacks.evaluate_gcg import evaluate_gcg
         with torch.enable_grad():

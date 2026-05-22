@@ -211,6 +211,12 @@ def parse_arguments():
                         help="Path to HarmBench behaviors CSV")
     parser.add_argument("--harmbench_n", type=int, default=100,
                         help="Number of HarmBench behaviors to sample (default: 100)")
+    parser.add_argument("--nonlinear_probe", action="store_true",
+                        help="Run nonlinear probe attack (RepE-style MLP)")
+    parser.add_argument("--nlprobe_hidden_dim", type=int, default=256,
+                        help="Hidden dim for nonlinear probe MLP (default: 256)")
+    parser.add_argument("--nlprobe_epochs", type=int, default=50,
+                        help="Training epochs for nonlinear probe (default: 50)")
     parser.add_argument("--skip_leace", action="store_true",
                         help="Skip LEACE attack evaluation (Stage 7c)")
     parser.add_argument("--skip_heretic", action="store_true",
@@ -704,6 +710,28 @@ def run_pipeline(args):
         print(f"[pre-defense] Undefended LEACE: "
               f"{undefended_leace['post_attack_refusal_score']:.4f}")
 
+    undefended_nlprobe = None
+    if args.nonlinear_probe:
+        from attacks.evaluate_nonlinear_probe import nonlinear_probe_attack
+        print("[pre-defense] Running nonlinear probe on undefended model …")
+        undefended_nlprobe = nonlinear_probe_attack(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            block_modules=model_base.model_block_modules,
+            attn_modules=model_base.model_attn_modules,
+            mlp_modules=model_base.model_mlp_modules,
+            harmful_prompts=harmful_val,
+            benign_prompts=harmless_val,
+            original_direction=original_direction,
+            refusal_toks=model_base.refusal_toks,
+            nlprobe_hidden_dim=args.nlprobe_hidden_dim,
+            nlprobe_epochs=args.nlprobe_epochs,
+        )
+        print(f"[pre-defense] Undefended NLProbe: "
+              f"{undefended_nlprobe['post_attack_refusal_score']:.4f} "
+              f"(max acc: {undefended_nlprobe['max_probe_accuracy']:.4f})")
+
     if args.undefended_only:
         print("\n" + "=" * 60)
         print("--undefended_only: Running black-box attacks on undefended model …")
@@ -825,7 +853,7 @@ def run_pipeline(args):
         if args.save_csv:
             import csv as _csv
             _fieldnames = [
-                "model", "defense_type", "projection_mode", "num_layers",
+                "model", "defense_type", "num_layers",
                 "per_layer_direction", "writer_output_directions",
                 "num_writer_directions", "writer_only",
                 "epsilon", "calibration_prompts", "pertinent_layers", "z_sum_norm",
@@ -838,6 +866,8 @@ def run_pipeline(args):
                 "perlayer_score_undefended", "perlayer_score_defended",
                 "arditi_score_undefended", "arditi_score_defended",
                 "leace_score_undefended", "leace_score_defended",
+                "nlprobe_score_undefended", "nlprobe_score_defended",
+                "nlprobe_max_accuracy_undefended", "nlprobe_max_accuracy_defended",
                 "kl_harmful", "kl_harmless",
                 "harmbench_asr",
                 "harmbench_asr_pre_attack",
@@ -868,7 +898,6 @@ def run_pipeline(args):
             row.update({
                 "model":           args.model_path,
                 "defense_type":    "none",
-                "projection_mode": "none",
                 "epsilon":         0.0,
                 "calibration_prompts": 0,
                 "per_layer_direction": False,
@@ -1429,6 +1458,37 @@ def run_pipeline(args):
             json.dump(leace_result, f, indent=4)
 
     # ==================================================================
+    # Stage 7b2: Nonlinear probe attack (Zou et al., NeurIPS 2023)
+    # ==================================================================
+    nlprobe_result = None
+    if args.nonlinear_probe:
+        from attacks.evaluate_nonlinear_probe import nonlinear_probe_attack
+
+        print("=" * 60)
+        print("Stage 7b2: Running nonlinear probe attack (RepE-style) …")
+        print("=" * 60)
+
+        nlprobe_result = nonlinear_probe_attack(
+            model=model_base.model,
+            tokenizer=model_base.tokenizer,
+            tokenize_fn=model_base.tokenize_instructions_fn,
+            block_modules=model_base.model_block_modules,
+            attn_modules=model_base.model_attn_modules,
+            mlp_modules=model_base.model_mlp_modules,
+            harmful_prompts=harmful_val,
+            benign_prompts=harmless_val,
+            original_direction=original_direction,
+            refusal_toks=model_base.refusal_toks,
+            nlprobe_hidden_dim=args.nlprobe_hidden_dim,
+            nlprobe_epochs=args.nlprobe_epochs,
+            base_fwd_pre_hooks=defense_fwd_pre_hooks,
+            base_fwd_hooks=defense_fwd_hooks,
+        )
+
+        with open(os.path.join(obf_artifact_dir, "nonlinear_probe_attack.json"), "w") as f:
+            json.dump(nlprobe_result, f, indent=4)
+
+    # ==================================================================
     # Stage 7c: GCG white-box attack (Zou et al. 2023)
     # ==================================================================
     gcg_result = None
@@ -1894,6 +1954,13 @@ def run_pipeline(args):
         print(f"  LEACE score        : {undef_leace:.4f} → {leace_result['post_attack_refusal_score']:.4f}")
         print(f"  LEACE max |cos_sim|: {leace_result['max_cos_sim']:.4f}")
 
+    if nlprobe_result:
+        undef_nlprobe_acc = undefended_nlprobe['max_probe_accuracy'] if undefended_nlprobe else float('nan')
+        undef_nlprobe_ref = undefended_nlprobe['post_attack_refusal_score'] if undefended_nlprobe else float('nan')
+        print(f"  --- Nonlinear probe attack (RepE-style) ---")
+        print(f"  NLProbe max acc    : {undef_nlprobe_acc:.4f} → {nlprobe_result['max_probe_accuracy']:.4f}")
+        print(f"  NLProbe refusal    : {undef_nlprobe_ref:.4f} → {nlprobe_result['post_attack_refusal_score']:.4f}")
+
     if gcg_result:
         print(f"  --- GCG attack (Zou et al.) ---")
         print(f"  Post-attack refusal: {gcg_result['post_attack_refusal_score']:.4f}")
@@ -1986,7 +2053,7 @@ def run_pipeline(args):
 
         csv_path = args.save_csv
         fieldnames = [
-            "model", "defense_type", "projection_mode", "num_layers",
+            "model", "defense_type", "num_layers",
             "per_layer_direction", "writer_output_directions",
             "num_writer_directions", "writer_only",
             "epsilon", "calibration_prompts", "pertinent_layers", "z_sum_norm",
@@ -1999,6 +2066,8 @@ def run_pipeline(args):
             "perlayer_score_undefended", "perlayer_score_defended",
             "arditi_score_undefended", "arditi_score_defended",
             "leace_score_undefended", "leace_score_defended",
+            "nlprobe_score_undefended", "nlprobe_score_defended",
+            "nlprobe_max_accuracy_undefended", "nlprobe_max_accuracy_defended",
             "kl_harmful", "kl_harmless",
             "harmbench_asr",
             "harmbench_asr_pre_attack",
@@ -2039,7 +2108,6 @@ def run_pipeline(args):
         row = {
             "model": args.model_path,
             "defense_type": args.defense_type,
-            "projection_mode": obf_cfg.projection_mode if args.defense_type == "obfuscation" else "—",
             "num_layers": len(obf_result["pertinent_layers"]),
             "per_layer_direction": obf_cfg.per_layer_direction,
             "writer_output_directions": obf_cfg.writer_output_directions,
@@ -2105,6 +2173,10 @@ def run_pipeline(args):
             ),
             "leace_score_undefended": "",
             "leace_score_defended": "",
+            "nlprobe_score_undefended": "",
+            "nlprobe_score_defended": "",
+            "nlprobe_max_accuracy_undefended": "",
+            "nlprobe_max_accuracy_defended": "",
             "harmbench_asr": "",
             "harmbench_asr_pre_attack": "",
             "harmbench_asr_post_gcg": "",
@@ -2142,6 +2214,12 @@ def run_pipeline(args):
             row["leace_score_undefended"] = f"{undefended_leace['post_attack_refusal_score']:.4f}"
         if leace_result:
             row["leace_score_defended"] = f"{leace_result['post_attack_refusal_score']:.4f}"
+        if undefended_nlprobe:
+            row["nlprobe_score_undefended"] = f"{undefended_nlprobe['post_attack_refusal_score']:.4f}"
+            row["nlprobe_max_accuracy_undefended"] = f"{undefended_nlprobe['max_probe_accuracy']:.4f}"
+        if nlprobe_result:
+            row["nlprobe_score_defended"] = f"{nlprobe_result['post_attack_refusal_score']:.4f}"
+            row["nlprobe_max_accuracy_defended"] = f"{nlprobe_result['max_probe_accuracy']:.4f}"
         if harmbench_result:
             row["harmbench_asr"] = f"{harmbench_result['asr']:.4f}"
             row["harmbench_asr_pre_attack"] = f"{harmbench_result['asr']:.4f}"
