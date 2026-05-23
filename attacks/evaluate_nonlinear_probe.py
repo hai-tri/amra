@@ -229,17 +229,18 @@ def nonlinear_probe_attack(
     probes = []
     norms = []
 
-    for ell in range(num_layers):
-        layer_acts = all_acts[:, ell, :]
-        probe, val_acc, mean, std = _train_nonlinear_probe(
-            layer_acts, labels,
-            hidden_dim=nlprobe_hidden_dim,
-            epochs=nlprobe_epochs,
-            seed=42 + ell,
-        )
-        per_layer_accuracy.append(val_acc)
-        probes.append(probe)
-        norms.append((mean, std))
+    with torch.enable_grad():
+        for ell in range(num_layers):
+            layer_acts = all_acts[:, ell, :]
+            probe, val_acc, mean, std = _train_nonlinear_probe(
+                layer_acts, labels,
+                hidden_dim=nlprobe_hidden_dim,
+                epochs=nlprobe_epochs,
+                seed=42 + ell,
+            )
+            per_layer_accuracy.append(val_acc)
+            probes.append(probe)
+            norms.append((mean, std))
 
     mean_acc = sum(per_layer_accuracy) / len(per_layer_accuracy)
     max_acc = max(per_layer_accuracy)
