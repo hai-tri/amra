@@ -372,22 +372,6 @@ def run_model(model_key):
 
     results["renellm"] = _check("ReNeLLM (1 strategy, 1 attempt)", _test_renellm)
 
-    def _test_softopt():
-        from attacks.evaluate_softopt import run_softopt_evaluation, SoftOptConfig
-        bench = os.path.join(REPO_DIR, "data", "harmbench_test_std.json")
-        with tempfile.TemporaryDirectory() as tmp:
-            with torch.enable_grad():
-                run_softopt_evaluation(
-                    model=model_base.model,
-                    tokenizer=model_base.tokenizer,
-                    benchmark_path=bench,
-                    output_dir=tmp,
-                    softopt_config=SoftOptConfig(num_steps=2),
-                    limit=1,
-                )
-
-    results["softopt"] = _check("SoftOpt (1 behavior, 2 steps)", _test_softopt)
-
     # ── Summary ──
     print(f"\n{'='*60}")
     passed = sum(1 for v in results.values() if v)

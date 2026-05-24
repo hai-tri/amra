@@ -69,7 +69,6 @@ _ATTACK_FLAGS=(
     --jailbroken --jailbroken_n_behaviors 25
     --pair --pair_n_behaviors 25
     --renellm
-    --softopt --softopt_limit 25
     --nonlinear_probe
 )
 _FINAL_EVAL_FLAGS=(

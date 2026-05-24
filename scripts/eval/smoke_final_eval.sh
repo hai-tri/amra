@@ -69,8 +69,6 @@ SMOKE_FLAGS=(
   --pair_iterations 1
   --renellm_strategies 1
   --renellm_attempts 1
-  --softopt_limit 1
-  --softopt_steps 2
 
   # Nonlinear probe, minimal epochs.
   --nonlinear_probe

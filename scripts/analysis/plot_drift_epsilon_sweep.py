@@ -1,9 +1,12 @@
 """
-Single-writer residual-stream drift across an epsilon sweep.
+Single-writer residual-stream drift sweep.
 
-Patches ONE weight matrix (W_O or W_down) at the selected layer using the
-current rank-k PCA writer update. Optionally adds rank-k reader and LM-head
-correction to measure how the compensated residual stream changes.
+Two modes (--sweep):
+  epsilon  — fixed layer, sweep epsilon values (default, original behavior)
+  layer    — fixed epsilon, sweep which layer is patched
+
+Patches ONE weight matrix (W_O or W_down) using the current rank-k PCA writer
+update. Optionally adds rank-k reader and LM-head correction.
 Saves per-metric .npz files compatible with plot_drift_combined.py.
 """
 
@@ -128,13 +131,21 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="llama",
                     help="Key into CONFIGS (llama, gemma, qwen) or a HF model ID")
+    ap.add_argument("--sweep", default="epsilon", choices=["epsilon", "layer"],
+                    help="Sweep mode: 'epsilon' (default) sweeps epsilon at a fixed "
+                         "layer; 'layer' sweeps which layer is patched at a fixed epsilon.")
     ap.add_argument("--writer", default="attn", choices=["attn", "mlp"],
                     help="Which single writer matrix to patch (W_O or W_down)")
     ap.add_argument("--layer", type=int, default=None,
                     help="Layer index for the single writer matrix. Default: use "
                          "the layer selected by refusal_direction artifacts.")
+    ap.add_argument("--layers", type=int, nargs="+", default=None,
+                    help="Layer indices to sweep in --sweep layer mode. "
+                         "Default: every 4th layer.")
     ap.add_argument("--epsilons", type=float, nargs="+",
                     default=[0.025, 0.1, 0.3, 1.0])
+    ap.add_argument("--epsilon", type=float, default=0.025,
+                    help="Fixed epsilon for --sweep layer mode (default: 0.025)")
     ap.add_argument("--k_w", type=int, default=1,
                     help="num_writer_directions for rank-k update")
     ap.add_argument("--k_r", type=int, default=None,
@@ -243,8 +254,18 @@ def main():
         print(f"[drift] overriding selected layer {layer} -> {args.layer}")
         layer = args.layer
 
-    # ── Extract writer-output refusal directions at the selected layer ────────
-    print(f"[drift] collecting writer-output refusal directions (layer={layer}) ...")
+    # ── Resolve sweep layers ──────────────────────────────────────────────────
+    if args.sweep == "layer":
+        sweep_layers = args.layers or list(range(0, components.num_layers, 4))
+        for sl in sweep_layers:
+            if sl < 0 or sl >= components.num_layers:
+                raise ValueError(f"layer {sl} out of range [0, {components.num_layers - 1}]")
+        collect_layers = sweep_layers
+    else:
+        collect_layers = [layer]
+
+    # ── Extract writer-output refusal directions ───────────────────────────────
+    print(f"[drift] collecting writer-output refusal directions (layers={collect_layers}) ...")
     if args.k_w > 1:
         subspaces = collect_writer_output_refusal_subspaces(
             model=model_base.model,
@@ -254,10 +275,10 @@ def main():
             tokenize_fn=model_base.tokenize_instructions_fn,
             num_prompts=args.num_calibration_prompts,
             num_directions=args.k_w,
-            layers=[layer],
+            layers=collect_layers,
             forward_batch_size=args.forward_batch_size,
         )
-        writer_dirs = subspaces[args.writer][layer]   # (k_w, d_model)
+        writer_dirs_per_layer = {ell: subspaces[args.writer][ell] for ell in collect_layers}
     else:
         dirs = collect_writer_output_refusal_directions(
             model=model_base.model,
@@ -268,9 +289,12 @@ def main():
             num_prompts=args.num_calibration_prompts,
             forward_batch_size=args.forward_batch_size,
         )
-        d_vec = dirs[args.writer][layer]              # (d_model,)
-        writer_dirs = (d_vec / (d_vec.norm() + 1e-8)).unsqueeze(0)  # (1, d_model)
+        writer_dirs_per_layer = {}
+        for ell in collect_layers:
+            d_vec = dirs[args.writer][ell]
+            writer_dirs_per_layer[ell] = (d_vec / (d_vec.norm() + 1e-8)).unsqueeze(0)
 
+    writer_dirs = writer_dirs_per_layer[layer]
     print(f"[drift] writer directions shape: {writer_dirs.shape}")
 
     # ── Snapshot clean weights ───────────────────────────────────────────────
@@ -285,58 +309,114 @@ def main():
         eval_prompts, components,
     )
 
-    # ── Sweep epsilons ───────────────────────────────────────────────────────
+    # ── Sweep ────────────────────────────────────────────────────────────────
     curves = {m: {} for m in args.metrics}
 
-    for eps in args.epsilons:
-        print(f"\n[drift] === epsilon={eps} ===")
-        model_base.model.load_state_dict(clean_state)
+    if args.sweep == "epsilon":
+        sweep_keys = args.epsilons
+        for eps in args.epsilons:
+            print(f"\n[drift] === epsilon={eps} ===")
+            model_base.model.load_state_dict(clean_state)
 
-        if args.with_readers:
-            cfg = ObfuscationConfig(
-                epsilon=eps,
-                num_calibration_prompts=args.num_calibration_prompts,
-                seed=args.seed,
-                projection_mode="full",
-                per_layer_direction=True,
-                writer_output_directions=True,
-                num_writer_directions=args.k_w,
-                num_reader_directions=reader_rank,
-                force_subspace_writer_update=True,
-                forward_batch_size=args.forward_batch_size,
-                patch_writers="attn_only" if args.writer == "attn" else "mlp_only",
-            )
-            apply_obfuscation(
-                model=model_base.model,
-                tokenize_fn=model_base.tokenize_instructions_fn,
-                harmful_prompts=harmful_train,
-                harmless_prompts=harmless_train,
-                mean_diffs=mean_diffs_train,
-                selected_pos=pos,
-                selected_layer=layer,
-                direction=direction,
-                cfg=cfg,
-                ablation_scores=ablation_scores,
-                explicit_layers=[layer],
-                writer_only=False,
-            )
-        else:
-            patch_single_writer(
-                model_base.model, components, layer,
-                args.writer, writer_dirs, eps, args.seed,
-            )
+            if args.with_readers:
+                cfg = ObfuscationConfig(
+                    epsilon=eps,
+                    num_calibration_prompts=args.num_calibration_prompts,
+                    seed=args.seed,
+                    projection_mode="full",
+                    per_layer_direction=True,
+                    writer_output_directions=True,
+                    num_writer_directions=args.k_w,
+                    num_reader_directions=reader_rank,
+                    force_subspace_writer_update=True,
+                    forward_batch_size=args.forward_batch_size,
+                    patch_writers="attn_only" if args.writer == "attn" else "mlp_only",
+                )
+                apply_obfuscation(
+                    model=model_base.model,
+                    tokenize_fn=model_base.tokenize_instructions_fn,
+                    harmful_prompts=harmful_train,
+                    harmless_prompts=harmless_train,
+                    mean_diffs=mean_diffs_train,
+                    selected_pos=pos,
+                    selected_layer=layer,
+                    direction=direction,
+                    cfg=cfg,
+                    ablation_scores=ablation_scores,
+                    explicit_layers=[layer],
+                    writer_only=False,
+                )
+            else:
+                patch_single_writer(
+                    model_base.model, components, layer,
+                    args.writer, writer_dirs, eps, args.seed,
+                )
 
-        print(f"  capturing patched residual streams ...")
-        patched = capture_residual_stream(
-            model_base.model, model_base.tokenize_instructions_fn,
-            eval_prompts, components,
-        )
-        for metric in args.metrics:
-            vals = compute_metric(clean_resid, patched, metric)
-            curves[metric][eps] = {
-                "mean": vals.mean(dim=0).numpy(),
-                "std":  vals.std(dim=0).numpy(),
-            }
+            print(f"  capturing patched residual streams ...")
+            patched = capture_residual_stream(
+                model_base.model, model_base.tokenize_instructions_fn,
+                eval_prompts, components,
+            )
+            for metric in args.metrics:
+                vals = compute_metric(clean_resid, patched, metric)
+                curves[metric][eps] = {
+                    "mean": vals.mean(dim=0).numpy(),
+                    "std":  vals.std(dim=0).numpy(),
+                }
+
+    else:  # layer sweep
+        sweep_keys = sweep_layers
+        fixed_eps = args.epsilon
+        for sl in sweep_layers:
+            print(f"\n[drift] === layer={sl}, epsilon={fixed_eps} ===")
+            model_base.model.load_state_dict(clean_state)
+
+            sl_dirs = writer_dirs_per_layer[sl]
+            if args.with_readers:
+                cfg = ObfuscationConfig(
+                    epsilon=fixed_eps,
+                    num_calibration_prompts=args.num_calibration_prompts,
+                    seed=args.seed,
+                    projection_mode="full",
+                    per_layer_direction=True,
+                    writer_output_directions=True,
+                    num_writer_directions=args.k_w,
+                    num_reader_directions=reader_rank,
+                    force_subspace_writer_update=True,
+                    forward_batch_size=args.forward_batch_size,
+                    patch_writers="attn_only" if args.writer == "attn" else "mlp_only",
+                )
+                apply_obfuscation(
+                    model=model_base.model,
+                    tokenize_fn=model_base.tokenize_instructions_fn,
+                    harmful_prompts=harmful_train,
+                    harmless_prompts=harmless_train,
+                    mean_diffs=mean_diffs_train,
+                    selected_pos=pos,
+                    selected_layer=sl,
+                    direction=direction,
+                    cfg=cfg,
+                    ablation_scores=ablation_scores,
+                    explicit_layers=[sl],
+                    writer_only=False,
+                )
+            else:
+                patch_single_writer(
+                    model_base.model, components, sl,
+                    args.writer, sl_dirs, fixed_eps, args.seed,
+                )
+
+            print(f"  capturing patched residual streams ...")
+            patched = capture_residual_stream(
+                model_base.model, model_base.tokenize_instructions_fn,
+                eval_prompts, components,
+            )
+            for metric in args.metrics:
+                vals = compute_metric(clean_resid, patched, metric)
+                curves[metric][sl] = {
+                    "mean": vals.mean(dim=0).numpy(),
+                    "std":  vals.std(dim=0).numpy(),
+                }
 
     model_base.model.load_state_dict(clean_state)
 
@@ -355,37 +435,72 @@ def main():
     cmap = plt.get_cmap("viridis")
 
     suffix = f"_{args.writer}_with_readers" if args.with_readers else f"_{args.writer}"
-    for metric in args.metrics:
-        npz_path = os.path.join(args.out_dir, f"drift_eps_sweep_{metric}{suffix}.npz")
-        np.savez(
-            npz_path,
-            layer=layer,
-            epsilons=np.array(args.epsilons),
-            **{f"mean_{eps}": curves[metric][eps]["mean"] for eps in args.epsilons},
-            **{f"std_{eps}":  curves[metric][eps]["std"]  for eps in args.epsilons},
-        )
-        print(f"Saved: {npz_path}")
 
-        fig, ax = plt.subplots(figsize=(8, 4.5))
-        for i, eps in enumerate(args.epsilons):
-            c = cmap(i / max(1, len(args.epsilons) - 1))
-            m = curves[metric][eps]["mean"]
-            s = curves[metric][eps]["std"]
-            ax.plot(x, m, marker="o", linewidth=1.8, color=c,
-                    label=fr"$\varepsilon = {eps}$")
-            ax.fill_between(x, m - s, m + s, alpha=0.12, color=c)
-        ax.axvline(layer, color="gray", linestyle="--",
-                   alpha=0.5, linewidth=0.8, label="selected layer")
-        ax.set_xlabel("Layer Index")
-        ax.set_ylabel(ylabels[metric])
-        ax.set_title(f"Residual Stream {metric_labels[metric]}")
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc="upper left")
-        plt.tight_layout()
-        png_path = os.path.join(args.out_dir, f"drift_eps_sweep_{metric}{suffix}.png")
-        plt.savefig(png_path, dpi=180)
-        plt.close()
-        print(f"Saved: {png_path}")
+    if args.sweep == "epsilon":
+        file_prefix = "drift_eps_sweep"
+        for metric in args.metrics:
+            npz_path = os.path.join(args.out_dir, f"{file_prefix}_{metric}{suffix}.npz")
+            np.savez(
+                npz_path,
+                layer=layer,
+                epsilons=np.array(args.epsilons),
+                **{f"mean_{eps}": curves[metric][eps]["mean"] for eps in args.epsilons},
+                **{f"std_{eps}":  curves[metric][eps]["std"]  for eps in args.epsilons},
+            )
+            print(f"Saved: {npz_path}")
+
+            fig, ax = plt.subplots(figsize=(8, 4.5))
+            for i, eps in enumerate(args.epsilons):
+                c = cmap(i / max(1, len(args.epsilons) - 1))
+                m = curves[metric][eps]["mean"]
+                s = curves[metric][eps]["std"]
+                ax.plot(x, m, marker="o", linewidth=1.8, color=c,
+                        label=fr"$\varepsilon = {eps}$")
+                ax.fill_between(x, m - s, m + s, alpha=0.12, color=c)
+            ax.axvline(layer, color="gray", linestyle="--",
+                       alpha=0.5, linewidth=0.8, label="selected layer")
+            ax.set_xlabel("Layer Index")
+            ax.set_ylabel(ylabels[metric])
+            ax.set_title(f"Residual Stream {metric_labels[metric]}")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="upper left")
+            plt.tight_layout()
+            png_path = os.path.join(args.out_dir, f"{file_prefix}_{metric}{suffix}.png")
+            plt.savefig(png_path, dpi=180)
+            plt.close()
+            print(f"Saved: {png_path}")
+
+    else:  # layer sweep
+        file_prefix = f"drift_layer_sweep_eps{args.epsilon}"
+        for metric in args.metrics:
+            npz_path = os.path.join(args.out_dir, f"{file_prefix}_{metric}{suffix}.npz")
+            np.savez(
+                npz_path,
+                epsilon=args.epsilon,
+                layers=np.array(sweep_layers),
+                **{f"mean_{sl}": curves[metric][sl]["mean"] for sl in sweep_layers},
+                **{f"std_{sl}":  curves[metric][sl]["std"]  for sl in sweep_layers},
+            )
+            print(f"Saved: {npz_path}")
+
+            fig, ax = plt.subplots(figsize=(8, 4.5))
+            for i, sl in enumerate(sweep_layers):
+                c = cmap(i / max(1, len(sweep_layers) - 1))
+                m = curves[metric][sl]["mean"]
+                s = curves[metric][sl]["std"]
+                ax.plot(x, m, marker="o", linewidth=1.8, color=c,
+                        label=f"patched layer {sl}")
+                ax.fill_between(x, m - s, m + s, alpha=0.12, color=c)
+            ax.set_xlabel("Layer Index")
+            ax.set_ylabel(ylabels[metric])
+            ax.set_title(fr"Residual Stream {metric_labels[metric]} ($\varepsilon$={args.epsilon})")
+            ax.grid(True, alpha=0.3)
+            ax.legend(loc="upper left")
+            plt.tight_layout()
+            png_path = os.path.join(args.out_dir, f"{file_prefix}_{metric}{suffix}.png")
+            plt.savefig(png_path, dpi=180)
+            plt.close()
+            print(f"Saved: {png_path}")
 
     print("\n[drift] done — run plot_drift_combined.py to render the 1x3 figure.")
 
