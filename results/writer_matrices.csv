@@ -1,5 +1,0 @@
-model_family,attn_writer,mlp_writer
-llama,o_proj,down_proj
-gemma,o_proj,down_proj
-mistral,o_proj,down_proj
-qwen,c_proj,c_proj

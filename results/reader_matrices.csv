@@ -1,5 +1,0 @@
-model_family,attn_reader_1,attn_reader_2,attn_reader_3,mlp_reader_1,mlp_reader_2
-llama,q_proj,k_proj,v_proj,gate_proj,up_proj
-gemma,q_proj,k_proj,v_proj,gate_proj,up_proj
-mistral,q_proj,k_proj,v_proj,gate_proj,up_proj
-qwen,,,,w1,w2
