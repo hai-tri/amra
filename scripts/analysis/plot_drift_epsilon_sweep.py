@@ -71,6 +71,12 @@ def patch_single_writer(model, components, layer, writer, directions, epsilon, s
     proj.weight.data = _rank_k_writer_update(proj.weight.data, directions, aliases)
 
 
+def patch_multiple_writers(model, components, layers, writer, dirs_per_layer, epsilon, seed):
+    """Apply rank-k writer update to multiple layers simultaneously."""
+    for ell in layers:
+        patch_single_writer(model, components, ell, writer, dirs_per_layer[ell], epsilon, seed + ell)
+
+
 def capture_residual_stream(model, tokenize_fn, prompts, components):
     """Returns list of per-prompt tensors, each shape (num_layers+1, T_p, d)."""
     device = next(model.parameters()).device
@@ -142,6 +148,12 @@ def main():
     ap.add_argument("--layers", type=int, nargs="+", default=None,
                     help="Layer indices to sweep in --sweep layer mode. "
                          "Default: every 4th layer.")
+    ap.add_argument("--layer_groups", type=str, nargs="+", default=None,
+                    help="Layer ranges for separate plots, e.g. '9-16' '17-23' '24-31'. "
+                         "Each group produces its own plot.")
+    ap.add_argument("--random_layers", type=int, default=0,
+                    help="If > 0, add a curve that patches N randomly chosen layers "
+                         "simultaneously (drawn from the full layer set).")
     ap.add_argument("--epsilons", type=float, nargs="+",
                     default=[0.025, 0.1, 0.3, 1.0])
     ap.add_argument("--epsilon", type=float, default=0.025,
@@ -255,14 +267,47 @@ def main():
         layer = args.layer
 
     # ── Resolve sweep layers ──────────────────────────────────────────────────
+    def _parse_layer_group(s, n_layers):
+        parts = s.split("-")
+        if len(parts) == 2:
+            return list(range(int(parts[0]), int(parts[1]) + 1))
+        return [int(s)]
+
+    random_layer_set = []
     if args.sweep == "layer":
-        sweep_layers = args.layers or list(range(0, components.num_layers, 4))
-        for sl in sweep_layers:
-            if sl < 0 or sl >= components.num_layers:
-                raise ValueError(f"layer {sl} out of range [0, {components.num_layers - 1}]")
+        if args.layer_groups:
+            all_group_layers = set()
+            groups = []
+            for g in args.layer_groups:
+                layers_in_group = _parse_layer_group(g, components.num_layers)
+                for sl in layers_in_group:
+                    if sl < 0 or sl >= components.num_layers:
+                        raise ValueError(f"layer {sl} out of range [0, {components.num_layers - 1}]")
+                groups.append((g, layers_in_group))
+                all_group_layers.update(layers_in_group)
+            sweep_layers = sorted(all_group_layers)
+        else:
+            sweep_layers = args.layers or list(range(0, components.num_layers, 4))
+            for sl in sweep_layers:
+                if sl < 0 or sl >= components.num_layers:
+                    raise ValueError(f"layer {sl} out of range [0, {components.num_layers - 1}]")
+            groups = None
+
+        if args.random_layers > 0:
+            rng = np.random.default_rng(args.seed)
+            random_layer_set = sorted(rng.choice(
+                components.num_layers, size=args.random_layers, replace=False,
+            ).tolist())
+            print(f"[drift] random {args.random_layers} layers: {random_layer_set}")
+            for rl in random_layer_set:
+                if rl not in sweep_layers:
+                    sweep_layers.append(rl)
+            sweep_layers = sorted(set(sweep_layers))
+
         collect_layers = sweep_layers
     else:
         collect_layers = [layer]
+        groups = None
 
     # ── Extract writer-output refusal directions ───────────────────────────────
     print(f"[drift] collecting writer-output refusal directions (layers={collect_layers}) ...")
@@ -418,6 +463,27 @@ def main():
                     "std":  vals.std(dim=0).numpy(),
                 }
 
+        random_key = None
+        if random_layer_set:
+            random_key = f"random{len(random_layer_set)}"
+            print(f"\n[drift] === random {len(random_layer_set)} layers: {random_layer_set}, epsilon={fixed_eps} ===")
+            model_base.model.load_state_dict(clean_state)
+            patch_multiple_writers(
+                model_base.model, components, random_layer_set,
+                args.writer, writer_dirs_per_layer, fixed_eps, args.seed,
+            )
+            print(f"  capturing patched residual streams ...")
+            patched = capture_residual_stream(
+                model_base.model, model_base.tokenize_instructions_fn,
+                eval_prompts, components,
+            )
+            for metric in args.metrics:
+                vals = compute_metric(clean_resid, patched, metric)
+                curves[metric][random_key] = {
+                    "mean": vals.mean(dim=0).numpy(),
+                    "std":  vals.std(dim=0).numpy(),
+                }
+
     model_base.model.load_state_dict(clean_state)
 
     # ── Save .npz and .png per metric ────────────────────────────────────────
@@ -471,36 +537,61 @@ def main():
             print(f"Saved: {png_path}")
 
     else:  # layer sweep
-        file_prefix = f"drift_layer_sweep_eps{args.epsilon}"
-        for metric in args.metrics:
-            npz_path = os.path.join(args.out_dir, f"{file_prefix}_{metric}{suffix}.npz")
-            np.savez(
-                npz_path,
-                epsilon=args.epsilon,
-                layers=np.array(sweep_layers),
-                **{f"mean_{sl}": curves[metric][sl]["mean"] for sl in sweep_layers},
-                **{f"std_{sl}":  curves[metric][sl]["std"]  for sl in sweep_layers},
-            )
-            print(f"Saved: {npz_path}")
+        def _plot_layer_group(plot_layers, group_tag, random_key):
+            file_prefix = f"drift_layer_sweep_eps{args.epsilon}_{group_tag}"
+            for metric in args.metrics:
+                save_keys = {f"mean_{sl}": curves[metric][sl]["mean"] for sl in plot_layers}
+                save_keys.update({f"std_{sl}": curves[metric][sl]["std"] for sl in plot_layers})
+                if random_key and random_key in curves[metric]:
+                    save_keys[f"mean_{random_key}"] = curves[metric][random_key]["mean"]
+                    save_keys[f"std_{random_key}"] = curves[metric][random_key]["std"]
 
-            fig, ax = plt.subplots(figsize=(8, 4.5))
-            for i, sl in enumerate(sweep_layers):
-                c = cmap(i / max(1, len(sweep_layers) - 1))
-                m = curves[metric][sl]["mean"]
-                s = curves[metric][sl]["std"]
-                ax.plot(x, m, marker="o", linewidth=1.8, color=c,
-                        label=f"patched layer {sl}")
-                ax.fill_between(x, m - s, m + s, alpha=0.12, color=c)
-            ax.set_xlabel("Layer Index")
-            ax.set_ylabel(ylabels[metric])
-            ax.set_title(fr"Residual Stream {metric_labels[metric]} ($\varepsilon$={args.epsilon})")
-            ax.grid(True, alpha=0.3)
-            ax.legend(loc="upper left")
+                npz_path = os.path.join(args.out_dir, f"{file_prefix}_{metric}{suffix}.npz")
+                np.savez(
+                    npz_path,
+                    epsilon=args.epsilon,
+                    layers=np.array(plot_layers),
+                    **({"random_layers": np.array(random_layer_set)} if random_key else {}),
+                    **save_keys,
+                )
+                print(f"Saved: {npz_path}")
+
+            fig, axes = plt.subplots(1, len(args.metrics), figsize=(7 * len(args.metrics), 4.5))
+            if len(args.metrics) == 1:
+                axes = [axes]
+            for ax, metric in zip(axes, args.metrics):
+                for i, sl in enumerate(plot_layers):
+                    c = cmap(i / max(1, len(plot_layers) - 1))
+                    m = curves[metric][sl]["mean"]
+                    s = curves[metric][sl]["std"]
+                    ax.plot(x, m, marker="o", linewidth=1.8, color=c,
+                            label=f"patched layer {sl}")
+                    ax.fill_between(x, m - s, m + s, alpha=0.12, color=c)
+                if random_key and random_key in curves[metric]:
+                    m = curves[metric][random_key]["mean"]
+                    s = curves[metric][random_key]["std"]
+                    rl_str = ",".join(str(r) for r in random_layer_set)
+                    ax.plot(x, m, marker="s", linewidth=2.0, color="black",
+                            linestyle="--", label=f"random {len(random_layer_set)} (L={rl_str})")
+                    ax.fill_between(x, m - s, m + s, alpha=0.08, color="black")
+                ax.set_xlabel("Layer Index")
+                ax.set_ylabel(ylabels[metric])
+                ax.set_title(metric_labels[metric])
+                ax.grid(True, alpha=0.3)
+                ax.legend(loc="upper left", fontsize=7)
+            fig.suptitle(fr"Residual Stream Drift — Layers {group_tag} ($\varepsilon$={args.epsilon})",
+                         fontsize=13)
             plt.tight_layout()
-            png_path = os.path.join(args.out_dir, f"{file_prefix}_{metric}{suffix}.png")
+            png_path = os.path.join(args.out_dir, f"{file_prefix}_combined{suffix}.png")
             plt.savefig(png_path, dpi=180)
             plt.close()
             print(f"Saved: {png_path}")
+
+        if groups:
+            for g_label, g_layers in groups:
+                _plot_layer_group(g_layers, f"L{g_label}", random_key)
+        else:
+            _plot_layer_group(sweep_layers, "all", random_key)
 
     print("\n[drift] done — run plot_drift_combined.py to render the 1x3 figure.")
 
